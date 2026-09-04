@@ -1,2 +1,5 @@
 streamlit
 pandas
+scikit-learn
+google-play-scraper
+google-genai
