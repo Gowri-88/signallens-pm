@@ -83,7 +83,12 @@ def find_app(company_name):
         results = gplay_search(company_name, lang="en", country="in", n_hits=5)
         if not results:
             return None
-        return results[0]  # best match
+        # Play Store search sometimes returns non-app suggestion entries with no real appId —
+        # skip those and return the first result that actually has one
+        for r in results:
+            if r.get("appId"):
+                return r
+        return None
     except Exception:
         return None
 
@@ -226,7 +231,7 @@ def run_full_analysis(company, client):
     reviews_df, fetch_error = fetch_reviews(app["appId"])
     if len(reviews_df) < MIN_REVIEWS_REQUIRED:
         status.update(label="Not enough data", state="error")
-        if fetch_error:
+        if fetch_error is not None:
             st.error(f"Review fetch failed with an error: {fetch_error}")
         st.warning(
             f"Only found {len(reviews_df)} usable reviews for {app['title']} — below our minimum threshold of "
