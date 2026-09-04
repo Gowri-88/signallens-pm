@@ -78,17 +78,32 @@ def call_gemini(client, prompt, max_retries_per_model=2):
     return None
 
 
+NON_CONSUMER_APP_TERMS = [
+    'delivery partner', 'partner app', 'for partners', 'driver', 'captain',
+    'merchant', 'seller', 'business app', 'for business', 'agent app', 'rider'
+]
+
+
 def find_app(company_name):
     try:
-        results = gplay_search(company_name, lang="en", country="in", n_hits=5)
+        results = gplay_search(company_name, lang="en", country="in", n_hits=8)
         if not results:
             return None
-        # Play Store search sometimes returns non-app suggestion entries with no real appId —
-        # skip those and return the first result that actually has one
-        for r in results:
-            if r.get("appId"):
-                return r
-        return None
+        valid = [r for r in results if r.get("appId")]
+        if not valid:
+            return None
+
+        def score(r):
+            title = (r.get("title") or "").lower()
+            # heavily deprioritize partner/driver/business/seller apps — we want the
+            # main consumer-facing app, not a sister app for a different user type
+            penalty = 1000 if any(term in title for term in NON_CONSUMER_APP_TERMS) else 0
+            starts_with_bonus = 0 if title.startswith(company_name.lower()) else 50
+            length_penalty = len(title)
+            return penalty + starts_with_bonus + length_penalty
+
+        valid.sort(key=score)
+        return valid[0]
     except Exception:
         return None
 
@@ -108,11 +123,13 @@ def fetch_reviews(app_id, target_count=TARGET_REVIEW_COUNT):
             break
     df = pd.DataFrame(all_reviews)
     if len(df) == 0:
-        return df, last_error
+        return df, last_error, None, None
     df = df[["reviewId", "content", "score", "at"]]
     df = df[df["content"].str.len() >= 15].reset_index(drop=True)
     df = df.drop_duplicates(subset="content").reset_index(drop=True)
-    return df, None
+    date_min = pd.to_datetime(df["at"]).min()
+    date_max = pd.to_datetime(df["at"]).max()
+    return df, None, date_min, date_max
 
 
 def classify_reviews(client, df, progress_bar):
@@ -228,7 +245,7 @@ def run_full_analysis(company, client):
     status.write(f"Found: **{app['title']}** ({app['appId']})")
 
     status.write("📥 Fetching reviews...")
-    reviews_df, fetch_error = fetch_reviews(app["appId"])
+    reviews_df, fetch_error, date_min, date_max = fetch_reviews(app["appId"])
     if len(reviews_df) < MIN_REVIEWS_REQUIRED:
         status.update(label="Not enough data", state="error")
         if fetch_error is not None:
@@ -240,6 +257,9 @@ def run_full_analysis(company, client):
         )
         return None
     status.write(f"Collected {len(reviews_df)} reviews (after removing duplicates/near-empty).")
+    date_range_str = f"{date_min.strftime('%Y-%m-%d')} to {date_max.strftime('%Y-%m-%d')}"
+    date_span_days = (date_max - date_min).days
+    status.write(f"📅 Date range covered: **{date_range_str}** ({date_span_days} day{'s' if date_span_days != 1 else ''})")
 
     status.write("🏷️ Classifying reviews (this takes a few minutes)...")
     progress = st.progress(0, text="Starting classification...")
@@ -311,7 +331,10 @@ def run_full_analysis(company, client):
     signals_df = pd.concat(all_subsets, ignore_index=True) if all_subsets else pd.DataFrame()
 
     status.update(label="Analysis complete!", state="complete")
-    return {"company": app["title"], "opportunities": opp_df, "signals": signals_df, "total_reviews": len(reviews_df)}
+    return {
+        "company": app["title"], "opportunities": opp_df, "signals": signals_df,
+        "total_reviews": len(reviews_df), "date_min": date_min, "date_max": date_max
+    }
 
 
 def confidence_color(conf):
@@ -382,10 +405,18 @@ if analyze:
         result = run_full_analysis(company.strip(), client)
         if result:
             st.markdown(f"## {result['company']} — Product Intelligence Report")
-            o1, o2, o3 = st.columns(3)
+            date_span_days = (result["date_max"] - result["date_min"]).days
+            o1, o2, o3, o4 = st.columns(4)
             o1.metric("Signals analyzed", result["total_reviews"])
             o2.metric("Opportunities found", len(result["opportunities"]))
-            o3.metric("Source", "Play Store")
+            o3.metric("Date range", f"{date_span_days} day{'s' if date_span_days != 1 else ''}")
+            o4.metric("Source", "Play Store")
+            st.caption(
+                f"📅 Reviews span **{result['date_min'].strftime('%Y-%m-%d')}** to "
+                f"**{result['date_max'].strftime('%Y-%m-%d')}**. High-volume apps may only cover hours or a day "
+                f"within this review cap; lower-volume apps may span weeks. Always check this before trusting "
+                f"a finding as \"current.\""
+            )
 
             with st.expander("⚠️ Data limitations — read before using this report", expanded=True):
                 st.markdown("""
