@@ -91,21 +91,23 @@ def find_app(company_name):
 def fetch_reviews(app_id, target_count=TARGET_REVIEW_COUNT):
     all_reviews = []
     token = None
+    last_error = None
     for _ in range(max(1, target_count // 100)):
         try:
             batch, token = gplay_reviews(app_id, lang="en", country="in", sort=Sort.NEWEST, count=100, continuation_token=token)
-        except Exception:
+        except Exception as e:
+            last_error = str(e)
             break
         all_reviews.extend(batch)
         if token is None or len(all_reviews) >= target_count:
             break
     df = pd.DataFrame(all_reviews)
     if len(df) == 0:
-        return df
+        return df, last_error
     df = df[["reviewId", "content", "score", "at"]]
     df = df[df["content"].str.len() >= 15].reset_index(drop=True)
     df = df.drop_duplicates(subset="content").reset_index(drop=True)
-    return df
+    return df, None
 
 
 def classify_reviews(client, df, progress_bar):
@@ -221,9 +223,11 @@ def run_full_analysis(company, client):
     status.write(f"Found: **{app['title']}** ({app['appId']})")
 
     status.write("📥 Fetching reviews...")
-    reviews_df = fetch_reviews(app["appId"])
+    reviews_df, fetch_error = fetch_reviews(app["appId"])
     if len(reviews_df) < MIN_REVIEWS_REQUIRED:
         status.update(label="Not enough data", state="error")
+        if fetch_error:
+            st.error(f"Review fetch failed with an error: {fetch_error}")
         st.warning(
             f"Only found {len(reviews_df)} usable reviews for {app['title']} — below our minimum threshold of "
             f"{MIN_REVIEWS_REQUIRED}. Per SignalLens's own evidence-quality rule, we don't generate a report on "
