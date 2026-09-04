@@ -84,51 +84,64 @@ NON_CONSUMER_APP_TERMS = [
 ]
 
 
-def find_app(company_name):
+def find_app_candidates(company_name, n=6):
     try:
-        results = gplay_search(company_name, lang="en", country="in", n_hits=8)
-        if not results:
-            return None
+        results = gplay_search(company_name, lang="en", country="in", n_hits=10)
         valid = [r for r in results if r.get("appId")]
         if not valid:
-            return None
+            return []
 
         def score(r):
             title = (r.get("title") or "").lower()
-            # heavily deprioritize partner/driver/business/seller apps — we want the
-            # main consumer-facing app, not a sister app for a different user type
             penalty = 1000 if any(term in title for term in NON_CONSUMER_APP_TERMS) else 0
             starts_with_bonus = 0 if title.startswith(company_name.lower()) else 50
             length_penalty = len(title)
             return penalty + starts_with_bonus + length_penalty
 
         valid.sort(key=score)
-        return valid[0]
+        return valid[:n]
     except Exception:
-        return None
+        return []
 
 
-def fetch_reviews(app_id, target_count=TARGET_REVIEW_COUNT):
+MAX_REVIEWS_SAFETY_CAP = 300  # bounds classification time/cost even for a wide date window
+
+def fetch_reviews(app_id, days_window=7):
+    import datetime
+    cutoff = pd.Timestamp.now() - pd.Timedelta(days=days_window)
     all_reviews = []
     token = None
     last_error = None
-    for _ in range(max(1, target_count // 100)):
+    for _ in range(20):  # safety limit on pagination loops
         try:
             batch, token = gplay_reviews(app_id, lang="en", country="in", sort=Sort.NEWEST, count=100, continuation_token=token)
         except Exception as e:
             last_error = str(e)
             break
+        if not batch:
+            break
         all_reviews.extend(batch)
-        if token is None or len(all_reviews) >= target_count:
+        oldest_in_batch = min(pd.to_datetime(r["at"]) for r in batch)
+        if oldest_in_batch < cutoff:
+            break
+        if len(all_reviews) >= MAX_REVIEWS_SAFETY_CAP:
+            break
+        if token is None:
             break
     df = pd.DataFrame(all_reviews)
     if len(df) == 0:
         return df, last_error, None, None
     df = df[["reviewId", "content", "score", "at"]]
+    df["at"] = pd.to_datetime(df["at"])
+    df = df[df["at"] >= cutoff]  # trim any overshoot past the window
     df = df[df["content"].str.len() >= 15].reset_index(drop=True)
     df = df.drop_duplicates(subset="content").reset_index(drop=True)
-    date_min = pd.to_datetime(df["at"]).min()
-    date_max = pd.to_datetime(df["at"]).max()
+    if len(df) > MAX_REVIEWS_SAFETY_CAP:
+        df = df.head(MAX_REVIEWS_SAFETY_CAP)
+    if len(df) == 0:
+        return df, None, None, None
+    date_min = df["at"].min()
+    date_max = df["at"].max()
     return df, None, date_min, date_max
 
 
@@ -233,27 +246,21 @@ def confidence_label(score):
 CHURN_PATTERN = r'(competitor|uninstall|switching|never (again|use)|deleting|delete (the |this )?app|moving away|switched to)'
 
 
-def run_full_analysis(company, client):
+def run_full_analysis(company, app, days_window, client):
     status = st.status("Analyzing " + company + "...", expanded=True)
 
-    status.write("🔍 Searching Play Store...")
-    app = find_app(company)
-    if app is None:
-        status.update(label="Not found", state="error")
-        st.error(f"Couldn't find a Play Store app matching \"{company}\". Try a more exact name.")
-        return None
-    status.write(f"Found: **{app['title']}** ({app['appId']})")
+    status.write(f"Using: **{app['title']}** ({app['appId']})")
 
     status.write("📥 Fetching reviews...")
-    reviews_df, fetch_error, date_min, date_max = fetch_reviews(app["appId"])
+    reviews_df, fetch_error, date_min, date_max = fetch_reviews(app["appId"], days_window=days_window)
     if len(reviews_df) < MIN_REVIEWS_REQUIRED:
         status.update(label="Not enough data", state="error")
         if fetch_error is not None:
             st.error(f"Review fetch failed with an error: {fetch_error}")
         st.warning(
-            f"Only found {len(reviews_df)} usable reviews for {app['title']} — below our minimum threshold of "
-            f"{MIN_REVIEWS_REQUIRED}. Per SignalLens's own evidence-quality rule, we don't generate a report on "
-            f"too little signal rather than fake confidence on a small sample."
+            f"Only found {len(reviews_df)} usable reviews for {app['title']} within the last {days_window} days — "
+            f"below our minimum threshold of {MIN_REVIEWS_REQUIRED}. Try a wider time window, or this app may "
+            f"not have enough public review volume for a meaningful report."
         )
         return None
     status.write(f"Collected {len(reviews_df)} reviews (after removing duplicates/near-empty).")
@@ -383,57 +390,85 @@ st.caption("Evidence-backed product intelligence for lean product teams — now 
 
 st.markdown("---")
 
+if "candidates" not in st.session_state:
+    st.session_state.candidates = None
+    st.session_state.company_query = ""
+
 col1, col2 = st.columns([2, 1])
 with col1:
     company = st.text_input("Company to analyze", placeholder="e.g. Zomato, Razorpay, Postman, Freshworks")
 with col2:
     st.write("")
     st.write("")
-    analyze = st.button("🔎 Analyze Product Landscape", type="primary", use_container_width=True)
+    search_clicked = st.button("🔍 Find App", type="secondary", use_container_width=True)
+
+time_window_label = st.selectbox(
+    "Time window",
+    ["Last 24 hours", "Last 7 days", "Last 30 days"],
+    index=1,
+    help="Higher-volume apps generate hundreds of reviews/day — a short window keeps the report current. "
+         "Lower-volume apps may need a wider window just to reach enough signal."
+)
+DAYS_MAP = {"Last 24 hours": 1, "Last 7 days": 7, "Last 30 days": 30}
+days_window = DAYS_MAP[time_window_label]
 
 st.caption(
-    f"⏱️ Live analysis fetches up to {TARGET_REVIEW_COUNT} recent Play Store reviews and runs them through "
-    f"classification + clustering — typically takes 2-5 minutes. Companies need at least {MIN_REVIEWS_REQUIRED} "
-    f"public reviews for a meaningful report."
+    f"⏱️ Live analysis fetches reviews within your chosen window (capped at {MAX_REVIEWS_SAFETY_CAP} for "
+    f"speed/cost) and runs them through classification + clustering — typically takes 2-5 minutes. "
+    f"Companies need at least {MIN_REVIEWS_REQUIRED} public reviews in that window for a meaningful report."
 )
 
-if analyze:
-    if not company.strip():
-        st.warning("Enter a company name to analyze.")
+if search_clicked and company.strip():
+    with st.spinner("Searching Play Store..."):
+        candidates = find_app_candidates(company.strip())
+    st.session_state.candidates = candidates
+    st.session_state.company_query = company.strip()
+
+if st.session_state.candidates:
+    if len(st.session_state.candidates) == 0:
+        st.error(f"Couldn't find any Play Store app matching \"{st.session_state.company_query}\". Try a different spelling.")
     else:
-        client = get_client()
-        result = run_full_analysis(company.strip(), client)
-        if result:
-            st.markdown(f"## {result['company']} — Product Intelligence Report")
-            date_span_days = (result["date_max"] - result["date_min"]).days
-            o1, o2, o3, o4 = st.columns(4)
-            o1.metric("Signals analyzed", result["total_reviews"])
-            o2.metric("Opportunities found", len(result["opportunities"]))
-            o3.metric("Date range", f"{date_span_days} day{'s' if date_span_days != 1 else ''}")
-            o4.metric("Source", "Play Store")
-            st.caption(
-                f"📅 Reviews span **{result['date_min'].strftime('%Y-%m-%d')}** to "
-                f"**{result['date_max'].strftime('%Y-%m-%d')}**. High-volume apps may only cover hours or a day "
-                f"within this review cap; lower-volume apps may span weeks. Always check this before trusting "
-                f"a finding as \"current.\""
-            )
+        st.markdown(f"**Found {len(st.session_state.candidates)} possible matches — confirm the right one:**")
+        options = {
+            f"{c['title']}  —  {c['appId']}": c for c in st.session_state.candidates
+        }
+        choice_label = st.radio("Select the correct app", list(options.keys()), index=0)
+        selected_app = options[choice_label]
 
-            with st.expander("⚠️ Data limitations — read before using this report", expanded=True):
-                st.markdown("""
+        analyze = st.button("✅ Analyze This App", type="primary")
+
+        if analyze:
+            client = get_client()
+            result = run_full_analysis(st.session_state.company_query, selected_app, days_window, client)
+            if result:
+                st.markdown(f"## {result['company']} — Product Intelligence Report")
+                date_span_days = (result["date_max"] - result["date_min"]).days
+                o1, o2, o3, o4 = st.columns(4)
+                o1.metric("Signals analyzed", result["total_reviews"])
+                o2.metric("Opportunities found", len(result["opportunities"]))
+                o3.metric("Date range", f"{date_span_days} day{'s' if date_span_days != 1 else ''}")
+                o4.metric("Source", "Play Store")
+                st.caption(
+                    f"📅 Reviews span **{result['date_min'].strftime('%Y-%m-%d')}** to "
+                    f"**{result['date_max'].strftime('%Y-%m-%d')}**. Always check this before trusting "
+                    f"a finding as \"current.\""
+                )
+
+                with st.expander("⚠️ Data limitations — read before using this report", expanded=True):
+                    st.markdown("""
 - **Single source** — Google Play Store only, no App Store/G2/Reddit yet.
-- **Recent reviews only** — this snapshot reflects a recent window, not long-term trend data.
 - **Themes and analysis text are AI-generated live** for this specific run, grounded in the actual review quotes shown in each drill-down — but not independently human-validated the way our original Swiggy report was.
-                """)
+                    """)
 
-            st.markdown("### Top Opportunities")
-            top_n = result["opportunities"].head(8)
-            for i, row in top_n.iterrows():
-                render_opportunity(row, result["signals"], i + 1)
+                st.markdown("### Top Opportunities")
+                top_n = result["opportunities"].head(8)
+                for i, row in top_n.iterrows():
+                    render_opportunity(row, result["signals"], i + 1)
 else:
     st.markdown("""
     ### How this works
-    1. Enter **any company** with a Play Store presence
-    2. Click **Analyze**
-    3. SignalLens fetches its reviews, classifies them, clusters them into named themes, scores the evidence,
-       and gives you an evidence-backed Product Opportunity Report — every claim traceable back to a real review.
+    1. Enter a company name and click **Find App** — confirm the right one from the matches shown
+    2. Pick a time window that fits the company's review volume
+    3. Click **Analyze** — SignalLens fetches, classifies, clusters, and scores the evidence, with every
+       claim traceable back to a real review.
     """)
