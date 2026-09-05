@@ -468,6 +468,52 @@ def run_full_analysis(company, app, days_window, client, extra_reviews_df=None):
     }
 
 
+RATING_PATTERN = re.compile(r'^\d(\.\d)?\s*/\s*5$')
+G2_BOILERPLATE_EXACT = {
+    "review collected by and hosted on g2.com.", "show more", "current user",
+    "validated reviewer", "incentivized", "g2 icon",
+}
+G2_BOILERPLATE_PREFIXES = ("source:", "what do you like", "what do you dislike")
+
+
+def _is_g2_boilerplate(line):
+    l = line.strip().lower()
+    if not l:
+        return True
+    if l in G2_BOILERPLATE_EXACT:
+        return True
+    if l.startswith(G2_BOILERPLATE_PREFIXES):
+        return True
+    return False
+
+
+def parse_g2_style_reviews(raw_text):
+    """G2/Capterra pages copy-paste as a multi-line block per reviewer: title, then a
+    rating on its own line (e.g. '4.5/5'), then like/dislike paragraphs mixed with
+    boilerplate. Use the rating line as an anchor between reviews, strip known
+    boilerplate, and merge the rest into one coherent review per reviewer."""
+    lines = raw_text.split("\n")
+    rating_indices = [i for i, l in enumerate(lines) if RATING_PATTERN.match(l.strip())]
+    rows = []
+    for pos, r_idx in enumerate(rating_indices):
+        try:
+            rating = float(lines[r_idx].strip().split("/")[0])
+        except ValueError:
+            continue
+        start = r_idx + 1
+        end = rating_indices[pos + 1] if pos + 1 < len(rating_indices) else len(lines)
+        block = lines[start:end]
+        content_lines = [l.strip() for l in block if not _is_g2_boilerplate(l)]
+        content = " ".join(content_lines).strip()
+        if len(content) >= 20:
+            rows.append({"content": content, "score": rating})
+    df = pd.DataFrame(rows)
+    if len(df) > 0:
+        df["reviewId"] = [f"pasted_{i}" for i in range(len(df))]
+        df = df.drop_duplicates(subset="content").reset_index(drop=True)
+    return df
+
+
 def parse_pasted_reviews(raw_text):
     """One review per line. Optional trailing ' | <1-5 rating>'. Rating is optional —
     G2/Capterra copy-paste often won't cleanly carry star ratings."""
@@ -675,144 +721,151 @@ if "candidates" not in st.session_state:
     st.session_state.candidates = None
     st.session_state.company_query = ""
 
-col1, col2 = st.columns([2, 1])
-with col1:
-    company = st.text_input("Company to analyze", placeholder="e.g. Zomato, Razorpay, Postman, Freshworks")
-with col2:
-    st.write("")
-    st.write("")
-    search_clicked = st.button("🔍 Find App", type="secondary", use_container_width=True)
+tab1, tab2 = st.tabs(["📱 Consumer Apps (Play Store)", "📋 B2B / Paste Reviews (G2, Capterra, etc.)"])
 
-time_window_label = st.selectbox(
-    "Time window",
-    ["Last 24 hours", "Last 7 days", "Last 30 days"],
-    index=1,
-    help="Higher-volume apps generate hundreds of reviews/day — a short window keeps the report current. "
-         "Lower-volume apps may need a wider window just to reach enough signal."
-)
-DAYS_MAP = {"Last 24 hours": 1, "Last 7 days": 7, "Last 30 days": 30}
-days_window = DAYS_MAP[time_window_label]
+with tab1:
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        company = st.text_input("Company to analyze", placeholder="e.g. Zomato, Razorpay, Postman, Freshworks")
+    with col2:
+        st.write("")
+        st.write("")
+        search_clicked = st.button("🔍 Find App", type="secondary", use_container_width=True)
 
-st.caption(
-    f"⏱️ Live analysis fetches reviews within your chosen window (capped at {MAX_REVIEWS_SAFETY_CAP} for "
-    f"speed/cost) and runs them through classification + clustering — typically takes 2-5 minutes. "
-    f"Companies need at least {MIN_REVIEWS_REQUIRED} public reviews in that window for a meaningful report."
-)
-
-if search_clicked and company.strip():
-    with st.spinner("Searching Play Store..."):
-        candidates = find_app_candidates(company.strip(), n=8)
-    st.session_state.candidates = candidates
-    st.session_state.company_query = company.strip()
-
-if st.session_state.candidates:
-    if len(st.session_state.candidates) == 0:
-        st.error(f"Couldn't find any Play Store app matching \"{st.session_state.company_query}\". Try a different spelling, or enter the package ID directly below.")
-    else:
-        st.markdown(f"**Found {len(st.session_state.candidates)} possible matches — confirm the right one:**")
-        st.caption("⚠️ Nothing is pre-selected. Double-check the title and package ID match what you're looking for before analyzing.")
-        options = {
-            f"{c['title']}  —  {c['appId']}": c for c in st.session_state.candidates
-        }
-        PLACEHOLDER = "— Select the correct app —"
-        choice_label = st.radio("Select the correct app", [PLACEHOLDER] + list(options.keys()), index=0)
-
-        if choice_label == PLACEHOLDER:
-            st.info("Pick an app above to continue.")
-        else:
-            selected_app = options[choice_label]
-            analyze = st.button("✅ Analyze This App", type="primary")
-
-            if analyze:
-                client = get_client()
-                result = run_full_analysis(st.session_state.company_query, selected_app, days_window, client)
-                if result:
-                    st.markdown(f"## {result['company']} — Product Intelligence Report")
-                    date_span_days = (result["date_max"] - result["date_min"]).days
-                    o1, o2, o3, o4 = st.columns(4)
-                    o1.metric("Signals analyzed", result["total_reviews"])
-                    o2.metric("Opportunities found", len(result["opportunities"]))
-                    o3.metric("Date range", f"{date_span_days} day{'s' if date_span_days != 1 else ''}")
-                    o4.metric("Source", "Play Store")
-                    st.caption(
-                        f"📅 Reviews span **{result['date_min'].strftime('%Y-%m-%d')}** to "
-                        f"**{result['date_max'].strftime('%Y-%m-%d')}**. Always check this before trusting "
-                        f"a finding as \"current.\""
-                    )
-                    if date_span_days < days_window / 2:
-                        st.warning(
-                            f"⚠️ You requested a {days_window}-day window, but this app generates so many "
-                            f"reviews that even the safety-capped sample only covers {date_span_days} day(s). "
-                            f"Treat this as a recent snapshot, not a {days_window}-day trend view."
-                        )
-
-                    with st.expander("⚠️ Data limitations — read before using this report", expanded=True):
-                        st.markdown("""
-- **Single source** — Google Play Store only, no App Store/G2/Reddit yet.
-- **Themes and analysis text are AI-generated live** for this specific run, grounded in the actual review quotes shown in each drill-down — but not independently human-validated the way our original Swiggy report was.
-                        """)
-
-                    st.markdown("### Top Opportunities")
-                    top_n = result["opportunities"].head(8)
-                    for i, row in top_n.iterrows():
-                        render_opportunity(row, result["signals"], i + 1)
-
-with st.expander("🔧 Can't find the right app? Enter its Play Store package ID directly"):
-    st.caption(
-        "Find this by searching the app on the Play Store website — the package ID is the part of the URL "
-        "after `id=`, e.g. play.google.com/store/apps/details?id=**in.swiggy.android**"
+    time_window_label = st.selectbox(
+        "Time window",
+        ["Last 24 hours", "Last 7 days", "Last 30 days"],
+        index=1,
+        help="Higher-volume apps generate hundreds of reviews/day — a short window keeps the report current. "
+             "Lower-volume apps may need a wider window just to reach enough signal."
     )
-    manual_id = st.text_input("Package ID", placeholder="e.g. in.swiggy.android", key="manual_pkg")
-    manual_name = st.text_input("Display name for this app", placeholder="e.g. Swiggy", key="manual_name")
-    manual_analyze = st.button("✅ Analyze This Package ID")
-    if manual_analyze and manual_id.strip():
-        client = get_client()
-        manual_app = {"title": manual_name.strip() or manual_id.strip(), "appId": manual_id.strip()}
-        result = run_full_analysis(manual_name.strip() or manual_id.strip(), manual_app, days_window, client)
-        if result:
-            st.markdown(f"## {result['company']} — Product Intelligence Report")
-            date_span_days = (result["date_max"] - result["date_min"]).days
-            o1, o2, o3, o4 = st.columns(4)
-            o1.metric("Signals analyzed", result["total_reviews"])
-            o2.metric("Opportunities found", len(result["opportunities"]))
-            o3.metric("Date range", f"{date_span_days} day{'s' if date_span_days != 1 else ''}")
-            o4.metric("Source", "Play Store")
-            st.caption(
-                f"📅 Reviews span **{result['date_min'].strftime('%Y-%m-%d')}** to "
-                f"**{result['date_max'].strftime('%Y-%m-%d')}**."
-            )
-            date_span_days = (result["date_max"] - result["date_min"]).days
-            if date_span_days < days_window / 2:
-                st.warning(
-                    f"⚠️ You requested a {days_window}-day window, but this app generates so many "
-                    f"reviews that even the safety-capped sample only covers {date_span_days} day(s). "
-                    f"Treat this as a recent snapshot, not a {days_window}-day trend view."
+    DAYS_MAP = {"Last 24 hours": 1, "Last 7 days": 7, "Last 30 days": 30}
+    days_window = DAYS_MAP[time_window_label]
+
+    st.caption(
+        f"⏱️ Live analysis fetches reviews within your chosen window (capped at {MAX_REVIEWS_SAFETY_CAP} for "
+        f"speed/cost) and runs them through classification + clustering — typically takes 2-5 minutes. "
+        f"Companies need at least {MIN_REVIEWS_REQUIRED} public reviews in that window for a meaningful report."
+    )
+
+    if search_clicked and company.strip():
+        with st.spinner("Searching Play Store..."):
+            candidates = find_app_candidates(company.strip(), n=8)
+        st.session_state.candidates = candidates
+        st.session_state.company_query = company.strip()
+
+    if st.session_state.candidates:
+        if len(st.session_state.candidates) == 0:
+            st.error(f"Couldn't find any Play Store app matching \"{st.session_state.company_query}\". Try a different spelling, or enter the package ID directly below.")
+        else:
+            st.markdown(f"**Found {len(st.session_state.candidates)} possible matches — confirm the right one:**")
+            st.caption("⚠️ Nothing is pre-selected. Double-check the title and package ID match what you're looking for before analyzing.")
+            options = {
+                f"{c['title']}  —  {c['appId']}": c for c in st.session_state.candidates
+            }
+            PLACEHOLDER = "— Select the correct app —"
+            choice_label = st.radio("Select the correct app", [PLACEHOLDER] + list(options.keys()), index=0)
+
+            if choice_label == PLACEHOLDER:
+                st.info("Pick an app above to continue.")
+            else:
+                selected_app = options[choice_label]
+                analyze = st.button("✅ Analyze This App", type="primary")
+
+                if analyze:
+                    client = get_client()
+                    result = run_full_analysis(st.session_state.company_query, selected_app, days_window, client)
+                    if result:
+                        st.markdown(f"## {result['company']} — Product Intelligence Report")
+                        date_span_days = (result["date_max"] - result["date_min"]).days
+                        o1, o2, o3, o4 = st.columns(4)
+                        o1.metric("Signals analyzed", result["total_reviews"])
+                        o2.metric("Opportunities found", len(result["opportunities"]))
+                        o3.metric("Date range", f"{date_span_days} day{'s' if date_span_days != 1 else ''}")
+                        o4.metric("Source", "Play Store")
+                        st.caption(
+                            f"📅 Reviews span **{result['date_min'].strftime('%Y-%m-%d')}** to "
+                            f"**{result['date_max'].strftime('%Y-%m-%d')}**. Always check this before trusting "
+                            f"a finding as \"current.\""
+                        )
+                        if date_span_days < days_window / 2:
+                            st.warning(
+                                f"⚠️ You requested a {days_window}-day window, but this app generates so many "
+                                f"reviews that even the safety-capped sample only covers {date_span_days} day(s). "
+                                f"Treat this as a recent snapshot, not a {days_window}-day trend view."
+                            )
+
+                        with st.expander("⚠️ Data limitations — read before using this report", expanded=True):
+                            st.markdown("""
+    - **Single source** — Google Play Store only, no App Store/G2/Reddit yet.
+    - **Themes and analysis text are AI-generated live** for this specific run, grounded in the actual review quotes shown in each drill-down — but not independently human-validated the way our original Swiggy report was.
+                            """)
+
+                        st.markdown("### Top Opportunities")
+                        top_n = result["opportunities"].head(8)
+                        for i, row in top_n.iterrows():
+                            render_opportunity(row, result["signals"], i + 1)
+
+    with st.expander("🔧 Can't find the right app? Enter its Play Store package ID directly"):
+        st.caption(
+            "Find this by searching the app on the Play Store website — the package ID is the part of the URL "
+            "after `id=`, e.g. play.google.com/store/apps/details?id=**in.swiggy.android**"
+        )
+        manual_id = st.text_input("Package ID", placeholder="e.g. in.swiggy.android", key="manual_pkg")
+        manual_name = st.text_input("Display name for this app", placeholder="e.g. Swiggy", key="manual_name")
+        manual_analyze = st.button("✅ Analyze This Package ID")
+        if manual_analyze and manual_id.strip():
+            client = get_client()
+            manual_app = {"title": manual_name.strip() or manual_id.strip(), "appId": manual_id.strip()}
+            result = run_full_analysis(manual_name.strip() or manual_id.strip(), manual_app, days_window, client)
+            if result:
+                st.markdown(f"## {result['company']} — Product Intelligence Report")
+                date_span_days = (result["date_max"] - result["date_min"]).days
+                o1, o2, o3, o4 = st.columns(4)
+                o1.metric("Signals analyzed", result["total_reviews"])
+                o2.metric("Opportunities found", len(result["opportunities"]))
+                o3.metric("Date range", f"{date_span_days} day{'s' if date_span_days != 1 else ''}")
+                o4.metric("Source", "Play Store")
+                st.caption(
+                    f"📅 Reviews span **{result['date_min'].strftime('%Y-%m-%d')}** to "
+                    f"**{result['date_max'].strftime('%Y-%m-%d')}**."
                 )
-            with st.expander("⚠️ Data limitations — read before using this report", expanded=True):
-                st.markdown("""
-- **Single source** — Google Play Store only, no App Store/G2/Reddit yet.
-- **Themes and analysis text are AI-generated live** for this specific run, grounded in the actual review quotes shown in each drill-down.
-                """)
-            st.markdown("### Top Opportunities")
-            for i, row in result["opportunities"].head(8).iterrows():
-                render_opportunity(row, result["signals"], i + 1)
+                date_span_days = (result["date_max"] - result["date_min"]).days
+                if date_span_days < days_window / 2:
+                    st.warning(
+                        f"⚠️ You requested a {days_window}-day window, but this app generates so many "
+                        f"reviews that even the safety-capped sample only covers {date_span_days} day(s). "
+                        f"Treat this as a recent snapshot, not a {days_window}-day trend view."
+                    )
+                with st.expander("⚠️ Data limitations — read before using this report", expanded=True):
+                    st.markdown("""
+    - **Single source** — Google Play Store only, no App Store/G2/Reddit yet.
+    - **Themes and analysis text are AI-generated live** for this specific run, grounded in the actual review quotes shown in each drill-down.
+                    """)
+                st.markdown("### Top Opportunities")
+                for i, row in result["opportunities"].head(8).iterrows():
+                    render_opportunity(row, result["signals"], i + 1)
 
-if not st.session_state.candidates:
-    st.markdown("""
-    ### How this works
-    1. Enter a company name and click **Find App** — confirm the right one from the matches shown
-    2. Pick a time window that fits the company's review volume
-    3. Click **Analyze** — SignalLens fetches, classifies, clusters, and scores the evidence, with every
-       claim traceable back to a real review.
+    if not st.session_state.candidates:
+        st.markdown("""
+        ### How this works
+        1. Enter a company name and click **Find App** — confirm the right one from the matches shown
+        2. Pick a time window that fits the company's review volume
+        3. Click **Analyze** — SignalLens fetches, classifies, clusters, and scores the evidence, with every
+           claim traceable back to a real review.
 
-    **Note:** some companies (especially B2B SaaS) publish separate apps per product rather than one unified
-    company app — pick the specific product you want analyzed. Some companies (especially dev tools) may have
-    no meaningful consumer Play Store presence at all.
-    """)
+        **Note:** some companies (especially B2B SaaS) publish separate apps per product rather than one unified
+        company app — pick the specific product you want analyzed. Some companies (especially dev tools) may have
+        no meaningful consumer Play Store presence at all.
+        """)
 
-st.markdown("---")
-
-with st.expander("📋 Analyze from pasted reviews (G2, Capterra, App Store, Reddit, etc.)"):
+with tab2:
+    st.markdown("### Analyze from pasted reviews")
+    st.caption(
+        "For sources without automated collection yet — G2, Capterra, App Store, Reddit. Best for B2B SaaS "
+        "companies without a consumer Play Store app. Paste one review per line for App Store/Reddit/Other. "
+        "For G2/Capterra, just paste the raw page content — SignalLens will find the ratings and reviews automatically."
+    )
     st.caption(
         "For sources without automated collection yet. Paste one review per line. If you have a star rating, "
         "add it after a `|`, e.g. `Support never responded to my tickets | 1` — ratings are optional."
@@ -828,7 +881,16 @@ with st.expander("📋 Analyze from pasted reviews (G2, Capterra, App Store, Red
         elif not paste_text.strip():
             st.warning("Paste at least a few reviews first.")
         else:
-            parsed_df = parse_pasted_reviews(paste_text)
+            if paste_source in ("G2", "Capterra"):
+                parsed_df = parse_g2_style_reviews(paste_text)
+                if len(parsed_df) < MIN_REVIEWS_REQUIRED:
+                    st.info(
+                        "Structured G2/Capterra parsing found too few reviews — falling back to "
+                        "simple one-line-per-review parsing on the same text."
+                    )
+                    parsed_df = parse_pasted_reviews(paste_text)
+            else:
+                parsed_df = parse_pasted_reviews(paste_text)
             client = get_client()
             result = run_pasted_analysis(paste_company.strip(), paste_source, parsed_df, client)
             if result:
