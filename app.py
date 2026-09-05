@@ -91,15 +91,38 @@ def find_app_candidates(company_name, n=6):
         if not valid:
             return []
 
+        query = company_name.lower()
+
+        def is_relevant(r):
+            # a result only counts as relevant if the query actually appears in the
+            # title or developer name — otherwise a short, totally unrelated app
+            # (e.g. "Slack" for a "freshworks" search) can sneak in via a length fluke
+            title = (r.get("title") or "").lower()
+            developer = (r.get("developer") or "").lower()
+            return query in title or query in developer
+
+        relevant = [r for r in valid if is_relevant(r)]
+        pool = relevant if relevant else valid  # fallback only if nothing matches at all
+
         def score(r):
             title = (r.get("title") or "").lower()
+            developer = (r.get("developer") or "").lower()
             penalty = 1000 if any(term in title for term in NON_CONSUMER_APP_TERMS) else 0
-            starts_with_bonus = 0 if title.startswith(company_name.lower()) else 50
-            length_penalty = len(title)
-            return penalty + starts_with_bonus + length_penalty
+            # developer name matching the company is the strongest signal (catches
+            # sub-brands like Freshdesk/Freshchat all published by "Freshworks Inc")
+            if query in developer:
+                relevance_bonus = -500
+            elif title.startswith(query):
+                relevance_bonus = -200
+            elif query in title:
+                relevance_bonus = -100
+            else:
+                relevance_bonus = 0
+            length_tiebreak = len(title) * 0.1  # only matters among near-ties now
+            return penalty + relevance_bonus + length_tiebreak
 
-        valid.sort(key=score)
-        return valid[:n]
+        pool.sort(key=score)
+        return pool[:n]
     except Exception:
         return []
 
@@ -420,13 +443,13 @@ st.caption(
 
 if search_clicked and company.strip():
     with st.spinner("Searching Play Store..."):
-        candidates = find_app_candidates(company.strip())
+        candidates = find_app_candidates(company.strip(), n=8)
     st.session_state.candidates = candidates
     st.session_state.company_query = company.strip()
 
 if st.session_state.candidates:
     if len(st.session_state.candidates) == 0:
-        st.error(f"Couldn't find any Play Store app matching \"{st.session_state.company_query}\". Try a different spelling.")
+        st.error(f"Couldn't find any Play Store app matching \"{st.session_state.company_query}\". Try a different spelling, or enter the package ID directly below.")
     else:
         st.markdown(f"**Found {len(st.session_state.candidates)} possible matches — confirm the right one:**")
         options = {
@@ -464,11 +487,49 @@ if st.session_state.candidates:
                 top_n = result["opportunities"].head(8)
                 for i, row in top_n.iterrows():
                     render_opportunity(row, result["signals"], i + 1)
-else:
+
+with st.expander("🔧 Can't find the right app? Enter its Play Store package ID directly"):
+    st.caption(
+        "Find this by searching the app on the Play Store website — the package ID is the part of the URL "
+        "after `id=`, e.g. play.google.com/store/apps/details?id=**in.swiggy.android**"
+    )
+    manual_id = st.text_input("Package ID", placeholder="e.g. in.swiggy.android", key="manual_pkg")
+    manual_name = st.text_input("Display name for this app", placeholder="e.g. Swiggy", key="manual_name")
+    manual_analyze = st.button("✅ Analyze This Package ID")
+    if manual_analyze and manual_id.strip():
+        client = get_client()
+        manual_app = {"title": manual_name.strip() or manual_id.strip(), "appId": manual_id.strip()}
+        result = run_full_analysis(manual_name.strip() or manual_id.strip(), manual_app, days_window, client)
+        if result:
+            st.markdown(f"## {result['company']} — Product Intelligence Report")
+            date_span_days = (result["date_max"] - result["date_min"]).days
+            o1, o2, o3, o4 = st.columns(4)
+            o1.metric("Signals analyzed", result["total_reviews"])
+            o2.metric("Opportunities found", len(result["opportunities"]))
+            o3.metric("Date range", f"{date_span_days} day{'s' if date_span_days != 1 else ''}")
+            o4.metric("Source", "Play Store")
+            st.caption(
+                f"📅 Reviews span **{result['date_min'].strftime('%Y-%m-%d')}** to "
+                f"**{result['date_max'].strftime('%Y-%m-%d')}**."
+            )
+            with st.expander("⚠️ Data limitations — read before using this report", expanded=True):
+                st.markdown("""
+- **Single source** — Google Play Store only, no App Store/G2/Reddit yet.
+- **Themes and analysis text are AI-generated live** for this specific run, grounded in the actual review quotes shown in each drill-down.
+                """)
+            st.markdown("### Top Opportunities")
+            for i, row in result["opportunities"].head(8).iterrows():
+                render_opportunity(row, result["signals"], i + 1)
+
+if not st.session_state.candidates:
     st.markdown("""
     ### How this works
     1. Enter a company name and click **Find App** — confirm the right one from the matches shown
     2. Pick a time window that fits the company's review volume
     3. Click **Analyze** — SignalLens fetches, classifies, clusters, and scores the evidence, with every
        claim traceable back to a real review.
+
+    **Note:** some companies (especially B2B SaaS) publish separate apps per product rather than one unified
+    company app — pick the specific product you want analyzed. Some companies (especially dev tools) may have
+    no meaningful consumer Play Store presence at all.
     """)
