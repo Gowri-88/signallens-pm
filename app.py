@@ -17,6 +17,7 @@ CATEGORIES = [
 ]
 MODEL_FALLBACK_LIST = ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.1-flash-lite"]
 MIN_REVIEWS_REQUIRED = 50
+MIN_REVIEWS_PASTED = 15  # manual paste is realistically 5-20 reviews, not 50 — separate, lower bar
 TARGET_REVIEW_COUNT = 150
 
 CLASSIFY_PROMPT = """Classify each of these {n} app reviews into exactly ONE category from this list:
@@ -38,18 +39,22 @@ Reviews:
 
 Respond with ONLY a JSON array of {n} category strings, in order, nothing else."""
 
-THEME_PROMPT = """You are analyzing a cluster of {n} customer reviews about "{company}" that a keyword algorithm grouped together because they're similar. Here are the top distinguishing words the algorithm found: {top_terms}
+THEME_PROMPT = """You are analyzing a cluster of {n} TOTAL customer reviews about "{company}" that a keyword algorithm grouped together because they're similar. Here are the top distinguishing words the algorithm found: {top_terms}
 
-Sample reviews from this cluster:
+Below are {sample_count} EXAMPLE reviews from this cluster (not all {n} — just a sample):
 {samples}
+
+IMPORTANT: when you reference a count in your response, always use the TOTAL of {n} reviews, never the number of examples shown above.
 
 Based ONLY on what's actually in these reviews (do not invent facts not present), respond with ONLY a JSON object with these exact fields:
 {{
   "theme_name": "a short, specific 5-10 word name for this problem",
-  "observed": "1-2 sentences stating only what the reviews literally show, referencing the review count",
+  "observed": "1-2 sentences stating only what the reviews literally show, referencing the TOTAL review count ({n}), not the example count",
   "inferred": "1-2 sentences of reasonable interpretation, clearly distinguished from fact",
   "unknown": "1-2 sentences on what remains genuinely unclear or unverified from this data alone",
-  "next_step": "one specific, concrete validation action a PM should take next — NEVER a build/fix instruction, always an investigation step"
+  "next_step": "one specific, concrete validation action a PM should take next — NEVER a build/fix instruction, always an investigation step",
+  "success_metric": "one specific, measurable primary metric a PM would track to know if a future fix actually worked (e.g. 'refund approval rate for damaged-item claims', 'crash-free session rate on Android'). Must be concrete and specific to THIS problem, not generic.",
+  "guardrail_metric": "one specific metric that should NOT get worse as a side effect of fixing this (e.g. 'average delivery time should not increase', 'support response time should not regress'). Must be a plausible tradeoff risk for THIS specific fix, not a generic guardrail."
 }}
 
 Respond with ONLY the JSON object, nothing else."""
@@ -230,10 +235,11 @@ def cluster_category(df, category, max_clusters=4):
 
 def generate_theme_analysis(client, company, subset, cluster_id, top_terms):
     cluster_df = subset[subset["sub_cluster"] == cluster_id]
-    samples = "\n".join([f"- {c[:150]}" for c in cluster_df["content"].head(5)])
+    sample_list = cluster_df["content"].head(5).tolist()
+    samples = "\n".join([f"- {c[:150]}" for c in sample_list])
     prompt = THEME_PROMPT.format(
-        n=len(cluster_df), company=company, top_terms=", ".join(top_terms),
-        samples=samples
+        n=len(cluster_df), sample_count=len(sample_list), company=company,
+        top_terms=", ".join(top_terms), samples=samples
     )
     result_text = call_gemini(client, prompt)
     if result_text:
@@ -246,7 +252,9 @@ def generate_theme_analysis(client, company, subset, cluster_id, top_terms):
         "observed": f"{len(cluster_df)} reviews share similar language but a theme summary could not be generated.",
         "inferred": "Unable to generate — inspect raw reviews below directly.",
         "unknown": "Full analysis unavailable for this cluster.",
-        "next_step": "Manually review the underlying signals below."
+        "next_step": "Manually review the underlying signals below.",
+        "success_metric": "Not available — theme summary generation failed.",
+        "guardrail_metric": "Not available — theme summary generation failed."
     }
 
 
@@ -428,6 +436,8 @@ def run_full_analysis(company, app, days_window, client, extra_reviews_df=None):
                 "inferred": analysis.get("inferred", ""),
                 "unknown": analysis.get("unknown", ""),
                 "next_step": analysis.get("next_step", ""),
+                "success_metric": analysis.get("success_metric", ""),
+                "guardrail_metric": analysis.get("guardrail_metric", ""),
             })
             cluster_rows = cluster_rows.copy()
             cluster_rows["theme"] = analysis.get("theme_name", f"{category} cluster {cid}")
@@ -546,11 +556,11 @@ def parse_pasted_reviews(raw_text):
 def run_pasted_analysis(company, source_label, reviews_df, client):
     status = st.status(f"Analyzing pasted {source_label} reviews for {company}...", expanded=True)
 
-    if len(reviews_df) < MIN_REVIEWS_REQUIRED:
+    if len(reviews_df) < MIN_REVIEWS_PASTED:
         status.update(label="Not enough data", state="error")
         st.warning(
             f"Only {len(reviews_df)} usable reviews pasted — below our minimum threshold of "
-            f"{MIN_REVIEWS_REQUIRED}. Paste more reviews for a meaningful report."
+            f"{MIN_REVIEWS_PASTED}. Paste more reviews for a meaningful report."
         )
         return None
 
@@ -596,6 +606,8 @@ def run_pasted_analysis(company, source_label, reviews_df, client):
                 "avg_rating": avg_rating, "pct_severe": pct_severe,
                 "observed": analysis.get("observed", ""), "inferred": analysis.get("inferred", ""),
                 "unknown": analysis.get("unknown", ""), "next_step": analysis.get("next_step", ""),
+                "success_metric": analysis.get("success_metric", ""),
+                "guardrail_metric": analysis.get("guardrail_metric", ""),
             })
             cluster_rows = cluster_rows.copy()
             cluster_rows["theme"] = analysis.get("theme_name", f"{category} cluster {cid}")
@@ -659,6 +671,14 @@ def render_pasted_opportunity(row, signals_df, rank):
             st.write(row["unknown"])
             st.markdown("**🎯 Recommended next step**")
             st.info(row["next_step"])
+            st.markdown("**📏 How you'd know it worked**")
+            sm_col, gm_col = st.columns(2)
+            with sm_col:
+                st.markdown("*Primary metric to track:*")
+                st.success(row.get("success_metric") or "Not available")
+            with gm_col:
+                st.markdown("*Guardrail — shouldn't get worse:*")
+                st.warning(row.get("guardrail_metric") or "Not available")
 
             st.markdown("**💬 Evidence drill-down — underlying signals**")
             theme_signals = signals_df[signals_df["theme"] == theme]
@@ -669,6 +689,20 @@ def render_pasted_opportunity(row, signals_df, rank):
                 display_df, use_container_width=True, hide_index=True,
                 column_config={"content": "Review text", "score": "Rating"}
             )
+
+
+def render_priority_callout(opportunities_df):
+    if len(opportunities_df) == 0:
+        return
+    top = opportunities_df.iloc[0]
+    st.markdown("#### 🎯 If you can only act on one thing")
+    with st.container(border=True):
+        st.markdown(f"**{top['theme']}**")
+        st.caption(
+            f"Highest evidence strength ({top['evidence_strength']:.0f}/100) among "
+            f"{len(opportunities_df)} opportunities identified — based on signal volume, severity, "
+            f"and churn language. Start here; the rest are ranked below for additional context."
+        )
 
 
 def confidence_color(conf):
@@ -699,6 +733,14 @@ def render_opportunity(row, signals_df, rank):
             st.write(row["unknown"])
             st.markdown("**🎯 Recommended next step**")
             st.info(row["next_step"])
+            st.markdown("**📏 How you'd know it worked**")
+            sm_col, gm_col = st.columns(2)
+            with sm_col:
+                st.markdown("*Primary metric to track:*")
+                st.success(row.get("success_metric") or "Not available")
+            with gm_col:
+                st.markdown("*Guardrail — shouldn't get worse:*")
+                st.warning(row.get("guardrail_metric") or "Not available")
 
             st.markdown("**💬 Evidence drill-down — underlying signals**")
             theme_signals = signals_df[signals_df["theme"] == theme]
@@ -801,6 +843,7 @@ with tab1:
     - **Themes and analysis text are AI-generated live** for this specific run, grounded in the actual review quotes shown in each drill-down — but not independently human-validated the way our original Swiggy report was.
                             """)
 
+                        render_priority_callout(result["opportunities"])
                         st.markdown("### Top Opportunities")
                         top_n = result["opportunities"].head(8)
                         for i, row in top_n.iterrows():
@@ -842,6 +885,7 @@ with tab1:
     - **Single source** — Google Play Store only, no App Store/G2/Reddit yet.
     - **Themes and analysis text are AI-generated live** for this specific run, grounded in the actual review quotes shown in each drill-down.
                     """)
+                render_priority_callout(result["opportunities"])
                 st.markdown("### Top Opportunities")
                 for i, row in result["opportunities"].head(8).iterrows():
                     render_opportunity(row, result["signals"], i + 1)
@@ -883,12 +927,18 @@ with tab2:
         else:
             if paste_source in ("G2", "Capterra"):
                 parsed_df = parse_g2_style_reviews(paste_text)
-                if len(parsed_df) < MIN_REVIEWS_REQUIRED:
+                # Only fall back if structured parsing found essentially nothing — meaning the
+                # rating-anchor pattern didn't match this paste's format at all. Do NOT compare
+                # against the full report minimum here — a paste of 10-15 real reviews is a
+                # realistic, successful outcome for manual copy-paste, not a failure to retry.
+                if len(parsed_df) < 3:
                     st.info(
-                        "Structured G2/Capterra parsing found too few reviews — falling back to "
+                        "Structured G2/Capterra parsing found no recognizable review blocks — falling back to "
                         "simple one-line-per-review parsing on the same text."
                     )
                     parsed_df = parse_pasted_reviews(paste_text)
+                else:
+                    st.caption(f"✅ Structured parsing found {len(parsed_df)} reviews with ratings correctly attached.")
             else:
                 parsed_df = parse_pasted_reviews(paste_text)
             client = get_client()
@@ -907,6 +957,7 @@ with tab2:
 - **Themes and analysis text are AI-generated live** for this specific run, grounded in the actual pasted text shown in each drill-down.
                     """)
 
+                render_priority_callout(result["opportunities"])
                 st.markdown("### Top Opportunities")
                 for i, row in result["opportunities"].head(8).iterrows():
                     render_pasted_opportunity(row, result["signals"], i + 1)
