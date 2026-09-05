@@ -317,6 +317,9 @@ def apply_theme_merge(opportunities, all_subsets, groups):
         merged_subsets.append(combined_signals)
 
     return merged_opportunities, merged_subsets
+
+
+def evidence_strength(signal_volume, max_volume, avg_rating, pct_churn):
     volume_score = min(40, (signal_volume / max_volume) * 40)
     severity_score = ((5 - avg_rating) / 4) * 30
     churn_score = pct_churn * 20
