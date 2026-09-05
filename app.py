@@ -321,7 +321,12 @@ def apply_theme_merge(opportunities, all_subsets, groups):
 
 def evidence_strength(signal_volume, max_volume, avg_rating, pct_churn):
     volume_score = min(40, (signal_volume / max_volume) * 40)
-    severity_score = ((5 - avg_rating) / 4) * 30
+    if avg_rating is not None:
+        severity_score = ((5 - avg_rating) / 4) * 30
+    else:
+        # no ratings available (e.g. pasted reviews without stars) — use a disclosed
+        # neutral midpoint rather than silently guessing or unfairly zeroing this out
+        severity_score = 15
     churn_score = pct_churn * 20
     source_score = 5
     return round(volume_score + severity_score + churn_score + source_score, 1)
@@ -338,7 +343,26 @@ def confidence_label(score):
 CHURN_PATTERN = r'(competitor|uninstall|switching|never (again|use)|deleting|delete (the |this )?app|moving away|switched to)'
 
 
-def run_full_analysis(company, app, days_window, client):
+def parse_pasted_reviews(raw_text, source_name):
+    """Turn manually pasted review text into the same schema as scraped reviews.
+    No real rating or date is available, so both are defaulted and clearly flagged —
+    never silently treated as if they were real Play Store data."""
+    lines = [l.strip() for l in raw_text.split("\n") if l.strip()]
+    if not lines:
+        return pd.DataFrame()
+    df = pd.DataFrame({
+        "reviewId": [f"pasted_{source_name}_{i}" for i in range(len(lines))],
+        "content": lines,
+        "score": 3.0,  # neutral default — no real rating available from pasted text
+        "at": pd.NaT,  # no real date available — excluded from date-range calculations
+        "source": source_name,
+        "has_real_date": False,
+    })
+    df = df[df["content"].str.len() >= 15].reset_index(drop=True)
+    return df
+
+
+def run_full_analysis(company, app, days_window, client, extra_reviews_df=None):
     status = st.status("Analyzing " + company + "...", expanded=True)
 
     status.write(f"Using: **{app['title']}** ({app['appId']})")
@@ -442,6 +466,163 @@ def run_full_analysis(company, app, days_window, client):
         "company": app["title"], "opportunities": opp_df, "signals": signals_df,
         "total_reviews": len(reviews_df), "date_min": date_min, "date_max": date_max
     }
+
+
+def parse_pasted_reviews(raw_text):
+    """One review per line. Optional trailing ' | <1-5 rating>'. Rating is optional —
+    G2/Capterra copy-paste often won't cleanly carry star ratings."""
+    rows = []
+    for line in raw_text.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        rating = None
+        content = line
+        if "|" in line:
+            parts = line.rsplit("|", 1)
+            candidate = parts[1].strip()
+            try:
+                r = float(candidate)
+                if 1 <= r <= 5:
+                    rating = r
+                    content = parts[0].strip()
+            except ValueError:
+                pass  # not a valid rating — treat the whole line as review text
+        if len(content) >= 15:
+            rows.append({"content": content, "score": rating})
+    df = pd.DataFrame(rows)
+    if len(df) > 0:
+        df["reviewId"] = [f"pasted_{i}" for i in range(len(df))]
+        df = df.drop_duplicates(subset="content").reset_index(drop=True)
+    return df
+
+
+def run_pasted_analysis(company, source_label, reviews_df, client):
+    status = st.status(f"Analyzing pasted {source_label} reviews for {company}...", expanded=True)
+
+    if len(reviews_df) < MIN_REVIEWS_REQUIRED:
+        status.update(label="Not enough data", state="error")
+        st.warning(
+            f"Only {len(reviews_df)} usable reviews pasted — below our minimum threshold of "
+            f"{MIN_REVIEWS_REQUIRED}. Paste more reviews for a meaningful report."
+        )
+        return None
+
+    n_with_rating = reviews_df["score"].notna().sum()
+    status.write(f"{len(reviews_df)} reviews received ({n_with_rating} with a rating, {len(reviews_df) - n_with_rating} without).")
+
+    status.write("🏷️ Classifying reviews (this takes a few minutes)...")
+    progress = st.progress(0, text="Starting classification...")
+    reviews_df = classify_reviews(client, reviews_df, progress)
+    progress.empty()
+
+    status.write("🧩 Clustering into themes...")
+    problem_categories = [c for c in CATEGORIES if c not in ("positive_experience", "noise_unclear", "feature_request")]
+    all_opportunities = []
+    all_subsets = []
+    theme_progress = st.progress(0, text="Generating theme analysis...")
+    total_clusters_est = sum(1 for c in problem_categories if (reviews_df["category"] == c).sum() >= 3)
+    done = 0
+
+    for category in problem_categories:
+        if (reviews_df["category"] == category).sum() < 3:
+            continue
+        subset, cluster_terms = cluster_category(reviews_df, category)
+        if isinstance(cluster_terms, int):
+            cluster_terms = {0: []}
+
+        for cid in subset["sub_cluster"].unique():
+            cluster_rows = subset[subset["sub_cluster"] == cid]
+            if len(cluster_rows) < 3:
+                continue
+            terms = cluster_terms.get(cid, [])
+            analysis = generate_theme_analysis(client, company, subset, cid, terms)
+
+            churn_pct = cluster_rows["content"].str.lower().str.contains(CHURN_PATTERN, regex=True, na=False).mean()
+            rated = cluster_rows["score"].dropna()
+            avg_rating = rated.mean() if len(rated) > 0 else None
+            pct_severe = (rated <= 2).mean() if len(rated) > 0 else None
+            vol = len(cluster_rows)
+
+            all_opportunities.append({
+                "theme": analysis.get("theme_name", f"{category} cluster {cid}"),
+                "category": category, "signal_volume": vol,
+                "avg_rating": avg_rating, "pct_severe": pct_severe,
+                "observed": analysis.get("observed", ""), "inferred": analysis.get("inferred", ""),
+                "unknown": analysis.get("unknown", ""), "next_step": analysis.get("next_step", ""),
+            })
+            cluster_rows = cluster_rows.copy()
+            cluster_rows["theme"] = analysis.get("theme_name", f"{category} cluster {cid}")
+            all_subsets.append(cluster_rows)
+            done += 1
+            theme_progress.progress(min(1.0, done / max(1, total_clusters_est)), text=f"Analyzed {done} themes...")
+
+    theme_progress.empty()
+
+    if len(all_opportunities) == 0:
+        status.update(label="No clear themes found", state="error")
+        st.warning("Not enough distinct signal to form themes — paste more reviews.")
+        return None
+
+    status.write(f"🔗 Checking for duplicate themes ({len(all_opportunities)} found so far)...")
+    groups = merge_duplicate_themes(client, company, all_opportunities)
+    all_opportunities, all_subsets = apply_theme_merge(all_opportunities, all_subsets, groups)
+    n_merged = sum(1 for g in groups if len(g) > 1)
+    if n_merged > 0:
+        status.write(f"🔗 Merged {n_merged} group(s) of duplicate themes into single opportunities.")
+
+    opp_df = pd.DataFrame(all_opportunities)
+    max_vol = opp_df["signal_volume"].max()
+    opp_df["evidence_strength"] = opp_df.apply(
+        lambda r: evidence_strength(r["signal_volume"], max_vol, r["avg_rating"], 0), axis=1
+    )
+    opp_df["confidence"] = opp_df["evidence_strength"].apply(confidence_label)
+    opp_df = opp_df.sort_values("evidence_strength", ascending=False).reset_index(drop=True)
+
+    signals_df = pd.concat(all_subsets, ignore_index=True) if all_subsets else pd.DataFrame()
+
+    status.update(label="Analysis complete!", state="complete")
+    return {
+        "company": company, "opportunities": opp_df, "signals": signals_df,
+        "total_reviews": len(reviews_df), "source_label": source_label,
+        "n_with_rating": n_with_rating
+    }
+
+
+def render_pasted_opportunity(row, signals_df, rank):
+    theme = row["theme"]
+    with st.container(border=True):
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            st.markdown(f"### #{rank} — {theme}")
+        with col2:
+            st.metric("Evidence Strength", f"{row['evidence_strength']:.0f}/100")
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Signals", int(row["signal_volume"]))
+        c2.metric("Avg Rating", f"{row['avg_rating']:.2f}★" if row["avg_rating"] is not None and not pd.isna(row["avg_rating"]) else "N/A")
+        c3.metric("Severe (≤2★)", f"{row['pct_severe']*100:.0f}%" if row["pct_severe"] is not None and not pd.isna(row["pct_severe"]) else "N/A")
+        c4.markdown(f"**Confidence**  \n{confidence_color(row['confidence'])} {row['confidence']}")
+
+        with st.expander("See full evidence-backed analysis"):
+            st.markdown("**✅ What we know (observed)**")
+            st.write(row["observed"])
+            st.markdown("**🤔 What we infer**")
+            st.write(row["inferred"])
+            st.markdown("**❓ What we don't know**")
+            st.write(row["unknown"])
+            st.markdown("**🎯 Recommended next step**")
+            st.info(row["next_step"])
+
+            st.markdown("**💬 Evidence drill-down — underlying signals**")
+            theme_signals = signals_df[signals_df["theme"] == theme]
+            st.caption(f"Showing up to 10 of {len(theme_signals)} underlying reviews.")
+            display_df = theme_signals[["content", "score"]].head(10).copy()
+            display_df["score"] = display_df["score"].apply(lambda x: f"{x:.0f}★" if pd.notna(x) else "no rating")
+            st.dataframe(
+                display_df, use_container_width=True, hide_index=True,
+                column_config={"content": "Review text", "score": "Rating"}
+            )
 
 
 def confidence_color(conf):
@@ -628,3 +809,42 @@ if not st.session_state.candidates:
     company app — pick the specific product you want analyzed. Some companies (especially dev tools) may have
     no meaningful consumer Play Store presence at all.
     """)
+
+st.markdown("---")
+
+with st.expander("📋 Analyze from pasted reviews (G2, Capterra, App Store, Reddit, etc.)"):
+    st.caption(
+        "For sources without automated collection yet. Paste one review per line. If you have a star rating, "
+        "add it after a `|`, e.g. `Support never responded to my tickets | 1` — ratings are optional."
+    )
+    paste_company = st.text_input("Company name", placeholder="e.g. Freshdesk", key="paste_company")
+    paste_source = st.selectbox("Source", ["G2", "Capterra", "App Store", "Reddit", "Other"], key="paste_source")
+    paste_text = st.text_area("Paste reviews (one per line)", height=200, key="paste_text")
+    paste_analyze = st.button("✅ Analyze Pasted Reviews", key="paste_analyze")
+
+    if paste_analyze:
+        if not paste_company.strip():
+            st.warning("Enter a company name.")
+        elif not paste_text.strip():
+            st.warning("Paste at least a few reviews first.")
+        else:
+            parsed_df = parse_pasted_reviews(paste_text)
+            client = get_client()
+            result = run_pasted_analysis(paste_company.strip(), paste_source, parsed_df, client)
+            if result:
+                st.markdown(f"## {result['company']} — Product Intelligence Report")
+                o1, o2, o3 = st.columns(3)
+                o1.metric("Signals analyzed", result["total_reviews"])
+                o2.metric("Opportunities found", len(result["opportunities"]))
+                o3.metric("Source", f"{result['source_label']} (pasted)")
+
+                with st.expander("⚠️ Data limitations — read before using this report", expanded=True):
+                    st.markdown(f"""
+- **Manually pasted, single snapshot** — no live fetch, no date range, reflects only what was pasted.
+- **{result['n_with_rating']} of {result['total_reviews']} reviews had a rating** — themes without ratings show evidence strength using a disclosed neutral severity substitute, not an invented number.
+- **Themes and analysis text are AI-generated live** for this specific run, grounded in the actual pasted text shown in each drill-down.
+                    """)
+
+                st.markdown("### Top Opportunities")
+                for i, row in result["opportunities"].head(8).iterrows():
+                    render_pasted_opportunity(row, result["signals"], i + 1)
