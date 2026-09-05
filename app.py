@@ -127,7 +127,7 @@ def find_app_candidates(company_name, n=6):
         return []
 
 
-MAX_REVIEWS_SAFETY_CAP = 300  # bounds classification time/cost even for a wide date window
+MAX_REVIEWS_SAFETY_CAP = 400  # bounds classification time/cost even for a wide date window
 
 def fetch_reviews(app_id, days_window=7):
     import datetime
@@ -250,7 +250,73 @@ def generate_theme_analysis(client, company, subset, cluster_id, top_terms):
     }
 
 
-def evidence_strength(signal_volume, max_volume, avg_rating, pct_churn):
+def merge_duplicate_themes(client, company, opportunities):
+    """One extra call at the end: check if any themes are really describing the same
+    underlying problem in different words, and merge them. Plain keyword similarity isn't
+    reliable enough for this (tested — paraphrases share too few exact words), so this
+    needs actual semantic judgment."""
+    if len(opportunities) <= 1:
+        return [[i] for i in range(len(opportunities))]
+
+    listing = "\n".join([f"{i+1}. {o['theme']} — {o['observed'][:150]}" for i, o in enumerate(opportunities)])
+    prompt = f"""Here are {len(opportunities)} customer-problem themes found in reviews for "{company}". Some may describe the SAME underlying problem in different words (e.g. "SMS verification failures" and "login code delivery issues" are the same problem — OTP/verification delivery — even though they share no exact words).
+
+Themes:
+{listing}
+
+Group these into merged clusters based on whether they describe the same real underlying problem, not just similar wording. Respond with ONLY a JSON array of groups, where each group is a list of the 1-based indices that belong together. Every index must appear in exactly one group. A group can contain just one index if it's genuinely distinct from all others.
+
+Example format: [[1, 3, 4], [2], [5, 6]]"""
+
+    result_text = call_gemini(client, prompt)
+    if result_text:
+        try:
+            groups = json.loads(result_text)
+            seen = set()
+            valid_groups = []
+            for g in groups:
+                g = [i - 1 for i in g if isinstance(i, int) and 0 <= i - 1 < len(opportunities) and (i - 1) not in seen]
+                if g:
+                    valid_groups.append(g)
+                    seen.update(g)
+            for i in range(len(opportunities)):
+                if i not in seen:
+                    valid_groups.append([i])
+            return valid_groups
+        except Exception:
+            pass
+    # fallback: no merging if the call fails — safer than crashing the report
+    return [[i] for i in range(len(opportunities))]
+
+
+def apply_theme_merge(opportunities, all_subsets, groups):
+    merged_opportunities = []
+    merged_subsets = []
+    for group in groups:
+        members = [opportunities[i] for i in group]
+        if len(members) == 1:
+            merged_opportunities.append(members[0])
+            merged_subsets.append(all_subsets[group[0]])
+            continue
+        # merge: keep the largest-volume member's text (safer than generating new text),
+        # sum volumes, weighted-average the numeric fields
+        members_sorted = sorted(members, key=lambda m: m["signal_volume"], reverse=True)
+        primary = members_sorted[0]
+        total_vol = sum(m["signal_volume"] for m in members)
+        weighted_rating = sum(m["avg_rating"] * m["signal_volume"] for m in members) / total_vol
+        weighted_severe = sum(m["pct_severe"] * m["signal_volume"] for m in members) / total_vol
+        merged = dict(primary)
+        merged["signal_volume"] = total_vol
+        merged["avg_rating"] = weighted_rating
+        merged["pct_severe"] = weighted_severe
+        merged_opportunities.append(merged)
+
+        combined_signals = pd.concat([all_subsets[i] for i in group], ignore_index=True)
+        combined_signals = combined_signals.copy()
+        combined_signals["theme"] = primary["theme"]  # unify theme label for drill-down
+        merged_subsets.append(combined_signals)
+
+    return merged_opportunities, merged_subsets
     volume_score = min(40, (signal_volume / max_volume) * 40)
     severity_score = ((5 - avg_rating) / 4) * 30
     churn_score = pct_churn * 20
@@ -345,11 +411,19 @@ def run_full_analysis(company, app, days_window, client):
 
     theme_progress.empty()
 
-    opp_df = pd.DataFrame(all_opportunities)
-    if len(opp_df) == 0:
+    if len(all_opportunities) == 0:
         status.update(label="No clear themes found", state="error")
         st.warning("Not enough distinct signal to form themes — try a company with more review volume.")
         return None
+
+    status.write(f"🔗 Checking for duplicate themes ({len(all_opportunities)} found so far)...")
+    groups = merge_duplicate_themes(client, company, all_opportunities)
+    all_opportunities, all_subsets = apply_theme_merge(all_opportunities, all_subsets, groups)
+    n_merged = sum(1 for g in groups if len(g) > 1)
+    if n_merged > 0:
+        status.write(f"🔗 Merged {n_merged} group(s) of duplicate themes into single opportunities.")
+
+    opp_df = pd.DataFrame(all_opportunities)
 
     max_vol = opp_df["signal_volume"].max()
     opp_df["evidence_strength"] = opp_df.apply(
@@ -452,41 +526,52 @@ if st.session_state.candidates:
         st.error(f"Couldn't find any Play Store app matching \"{st.session_state.company_query}\". Try a different spelling, or enter the package ID directly below.")
     else:
         st.markdown(f"**Found {len(st.session_state.candidates)} possible matches — confirm the right one:**")
+        st.caption("⚠️ Nothing is pre-selected. Double-check the title and package ID match what you're looking for before analyzing.")
         options = {
             f"{c['title']}  —  {c['appId']}": c for c in st.session_state.candidates
         }
-        choice_label = st.radio("Select the correct app", list(options.keys()), index=0)
-        selected_app = options[choice_label]
+        PLACEHOLDER = "— Select the correct app —"
+        choice_label = st.radio("Select the correct app", [PLACEHOLDER] + list(options.keys()), index=0)
 
-        analyze = st.button("✅ Analyze This App", type="primary")
+        if choice_label == PLACEHOLDER:
+            st.info("Pick an app above to continue.")
+        else:
+            selected_app = options[choice_label]
+            analyze = st.button("✅ Analyze This App", type="primary")
 
-        if analyze:
-            client = get_client()
-            result = run_full_analysis(st.session_state.company_query, selected_app, days_window, client)
-            if result:
-                st.markdown(f"## {result['company']} — Product Intelligence Report")
-                date_span_days = (result["date_max"] - result["date_min"]).days
-                o1, o2, o3, o4 = st.columns(4)
-                o1.metric("Signals analyzed", result["total_reviews"])
-                o2.metric("Opportunities found", len(result["opportunities"]))
-                o3.metric("Date range", f"{date_span_days} day{'s' if date_span_days != 1 else ''}")
-                o4.metric("Source", "Play Store")
-                st.caption(
-                    f"📅 Reviews span **{result['date_min'].strftime('%Y-%m-%d')}** to "
-                    f"**{result['date_max'].strftime('%Y-%m-%d')}**. Always check this before trusting "
-                    f"a finding as \"current.\""
-                )
+            if analyze:
+                client = get_client()
+                result = run_full_analysis(st.session_state.company_query, selected_app, days_window, client)
+                if result:
+                    st.markdown(f"## {result['company']} — Product Intelligence Report")
+                    date_span_days = (result["date_max"] - result["date_min"]).days
+                    o1, o2, o3, o4 = st.columns(4)
+                    o1.metric("Signals analyzed", result["total_reviews"])
+                    o2.metric("Opportunities found", len(result["opportunities"]))
+                    o3.metric("Date range", f"{date_span_days} day{'s' if date_span_days != 1 else ''}")
+                    o4.metric("Source", "Play Store")
+                    st.caption(
+                        f"📅 Reviews span **{result['date_min'].strftime('%Y-%m-%d')}** to "
+                        f"**{result['date_max'].strftime('%Y-%m-%d')}**. Always check this before trusting "
+                        f"a finding as \"current.\""
+                    )
+                    if date_span_days < days_window / 2:
+                        st.warning(
+                            f"⚠️ You requested a {days_window}-day window, but this app generates so many "
+                            f"reviews that even the safety-capped sample only covers {date_span_days} day(s). "
+                            f"Treat this as a recent snapshot, not a {days_window}-day trend view."
+                        )
 
-                with st.expander("⚠️ Data limitations — read before using this report", expanded=True):
-                    st.markdown("""
+                    with st.expander("⚠️ Data limitations — read before using this report", expanded=True):
+                        st.markdown("""
 - **Single source** — Google Play Store only, no App Store/G2/Reddit yet.
 - **Themes and analysis text are AI-generated live** for this specific run, grounded in the actual review quotes shown in each drill-down — but not independently human-validated the way our original Swiggy report was.
-                    """)
+                        """)
 
-                st.markdown("### Top Opportunities")
-                top_n = result["opportunities"].head(8)
-                for i, row in top_n.iterrows():
-                    render_opportunity(row, result["signals"], i + 1)
+                    st.markdown("### Top Opportunities")
+                    top_n = result["opportunities"].head(8)
+                    for i, row in top_n.iterrows():
+                        render_opportunity(row, result["signals"], i + 1)
 
 with st.expander("🔧 Can't find the right app? Enter its Play Store package ID directly"):
     st.caption(
@@ -512,6 +597,13 @@ with st.expander("🔧 Can't find the right app? Enter its Play Store package ID
                 f"📅 Reviews span **{result['date_min'].strftime('%Y-%m-%d')}** to "
                 f"**{result['date_max'].strftime('%Y-%m-%d')}**."
             )
+            date_span_days = (result["date_max"] - result["date_min"]).days
+            if date_span_days < days_window / 2:
+                st.warning(
+                    f"⚠️ You requested a {days_window}-day window, but this app generates so many "
+                    f"reviews that even the safety-capped sample only covers {date_span_days} day(s). "
+                    f"Treat this as a recent snapshot, not a {days_window}-day trend view."
+                )
             with st.expander("⚠️ Data limitations — read before using this report", expanded=True):
                 st.markdown("""
 - **Single source** — Google Play Store only, no App Store/G2/Reddit yet.
