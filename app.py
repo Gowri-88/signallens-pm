@@ -134,7 +134,49 @@ def find_app_candidates(company_name, n=15):
         return []
 
 
+def app_search_widget(label, key_prefix):
+    """Reusable search-and-confirm block, used 2-3x for target + competitor(s) without
+    duplicating the whole search/candidate-list/radio pattern each time."""
+    name = st.text_input(f"{label} company name", key=f"{key_prefix}_name")
+    find_clicked = st.button(f"🔍 Find {label} App", key=f"{key_prefix}_find_btn")
+
+    if find_clicked and name.strip():
+        with st.spinner(f"Searching for {label.lower()}..."):
+            candidates = find_app_candidates(name.strip(), n=10)
+        st.session_state[f"{key_prefix}_candidates"] = candidates
+        st.session_state[f"{key_prefix}_query"] = name.strip()
+
+    candidates = st.session_state.get(f"{key_prefix}_candidates")
+    if candidates:
+        if len(candidates) == 0:
+            st.error(f"No matches found for \"{st.session_state[f'{key_prefix}_query']}\".")
+            return None
+        options = {f"{c['title']} — {c['appId']}": c for c in candidates}
+        PLACEHOLDER = f"— Select {label}'s app —"
+        choice = st.radio(f"Confirm {label}'s app", [PLACEHOLDER] + list(options.keys()), key=f"{key_prefix}_radio")
+        if choice != PLACEHOLDER:
+            return {"title": options[choice]["title"], "appId": options[choice]["appId"],
+                     "query": st.session_state[f"{key_prefix}_query"]}
+    return None
+
+
 MAX_REVIEWS_SAFETY_CAP = 600  # bounds classification time/cost even for a wide date window — raised from 400
+
+def check_name_mention_rate(company_name, reviews_df, sample_size=100):
+    """Sanity check for a real failure mode we found: some Play Store apps get rebranded
+    while keeping the same package ID, so old reviews for a DIFFERENT company can still be
+    sitting in the review history. We don't try to guess what the other brand might be —
+    that would need a fragile blocklist. Instead we just flag when the searched company's
+    own name is suspiciously absent, and let the person verify."""
+    main_word = company_name.split()[0].lower()
+    if len(main_word) < 3:
+        return None  # too short/generic a word to check reliably (e.g. "BK", "Go")
+    sample = reviews_df["content"].head(sample_size).str.lower()
+    mention_rate = sample.str.contains(main_word, regex=False, na=False).mean()
+    if len(sample) >= 20 and mention_rate < 0.03:
+        return mention_rate
+    return None
+
 
 def fetch_reviews(app_id, days_window=7):
     cutoff = pd.Timestamp.now() - pd.Timedelta(days=days_window)
@@ -411,6 +453,15 @@ def run_full_analysis(company, app, days_window, client, extra_reviews_df=None):
                 f"this app's retrievable review history through this data source is shorter than "
                 f"{days_window} days, not a cap issue."
             )
+
+    mention_rate = check_name_mention_rate(company, reviews_df)
+    if mention_rate is not None:
+        st.warning(
+            f"⚠️ Only {mention_rate*100:.0f}% of these reviews mention \"{company}\" by name. "
+            f"Some Play Store apps get rebranded to a new company while keeping the same package ID, "
+            f"which means old reviews for a DIFFERENT company can still show up here. Spot-check a few "
+            f"reviews in the drill-down below before trusting this report."
+        )
 
     status.write("🏷️ Classifying reviews (this takes a few minutes)...")
     progress = st.progress(0, text="Starting classification...")
@@ -711,6 +762,65 @@ def render_pasted_opportunity(row, signals_df, rank):
             )
 
 
+def render_comparison(company_results):
+    """company_results: list of {'label': 'Target'/'Competitor 1'/etc, 'result': <result dict>}"""
+    st.markdown("## 🆚 Competitive Comparison")
+    st.caption(
+        "Compared at the category level (not exact theme names, since two companies' clusters won't share "
+        "identical wording). Volume differences are reported as observations, not verdicts — a category "
+        "with more signal for one company means more complaints were found in this data, not a confirmed "
+        "product failing."
+    )
+
+    # roll up each company's opportunities to category level
+    rollups = {}
+    for entry in company_results:
+        df = entry["result"]["opportunities"]
+        cat_rollup = df.groupby("category").agg(
+            volume=("signal_volume", "sum"),
+            max_evidence=("evidence_strength", "max")
+        )
+        rollups[entry["label"]] = cat_rollup
+
+    all_categories = sorted(set().union(*[r.index for r in rollups.values()]))
+    labels = [e["label"] for e in company_results]
+
+    table_rows = []
+    for cat in all_categories:
+        row = {"Category": cat.replace("_", " ").title()}
+        for label in labels:
+            r = rollups[label]
+            row[label] = int(r.loc[cat, "volume"]) if cat in r.index else 0
+        table_rows.append(row)
+    comparison_df = pd.DataFrame(table_rows)
+    st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Notable gaps")
+    target_label = labels[0]
+    other_labels = labels[1:]
+    found_gap = False
+    for cat in all_categories:
+        target_vol = rollups[target_label].loc[cat, "volume"] if cat in rollups[target_label].index else 0
+        for other_label in other_labels:
+            other_vol = rollups[other_label].loc[cat, "volume"] if cat in rollups[other_label].index else 0
+            if target_vol > 0 and other_vol == 0:
+                st.markdown(
+                    f"- **{target_label}** has {int(target_vol)} signals in *{cat.replace('_',' ')}* — "
+                    f"**{other_label}** shows none in this data. {target_label} appears weaker here, "
+                    f"based on public signal volume alone."
+                )
+                found_gap = True
+            elif target_vol > other_vol * 1.5 and other_vol > 0:
+                st.markdown(
+                    f"- **{target_label}** shows notably more signal in *{cat.replace('_',' ')}* "
+                    f"({int(target_vol)} vs {other_label}'s {int(other_vol)}) — worth investigating "
+                    f"whether this reflects a real competitive gap."
+                )
+                found_gap = True
+    if not found_gap:
+        st.caption("No category shows a large volume gap between companies in this data.")
+
+
 def generate_report_markdown(company, opportunities_df, total_reviews, source_label, date_min=None, date_max=None):
     lines = [f"# {company} — Product Intelligence Report", ""]
     lines.append(f"**Signals analyzed:** {total_reviews}")
@@ -990,6 +1100,60 @@ with tab1:
         company app — pick the specific product you want analyzed. Some companies (especially dev tools) may have
         no meaningful consumer Play Store presence at all.
         """)
+
+    st.markdown("---")
+    st.markdown("## 🆚 Compare with Competitors (optional)")
+    st.caption(
+        "Separate from the single-company analysis above. Runs the full pipeline once per company, so this "
+        "takes roughly 2-3x as long as a single report — expect 5-12 minutes for 2 companies, more for 3."
+    )
+
+    if "cmp_show_second" not in st.session_state:
+        st.session_state.cmp_show_second = False
+
+    target_app = app_search_widget("Your Company", "cmp_target")
+
+    st.markdown("")
+    comp1_app = app_search_widget("Competitor 1", "cmp_comp1")
+
+    if not st.session_state.cmp_show_second:
+        if st.button("➕ Add second competitor"):
+            st.session_state.cmp_show_second = True
+            st.rerun()
+    else:
+        st.markdown("")
+        comp2_app = app_search_widget("Competitor 2", "cmp_comp2")
+
+    confirmed_competitors = [c for c in [comp1_app, comp2_app if st.session_state.cmp_show_second else None] if c]
+
+    if target_app and confirmed_competitors:
+        st.markdown("")
+        run_comparison = st.button("🔎 Analyze Target + Competitors", type="primary")
+        if run_comparison:
+            client = get_client()
+            company_results = []
+            all_apps = [{"label": "Target", **target_app}] + [
+                {"label": f"Competitor {i+1}", **c} for i, c in enumerate(confirmed_competitors)
+            ]
+            for entry in all_apps:
+                st.markdown(f"### Analyzing {entry['label']}: {entry['title']}")
+                result = run_full_analysis(entry["title"], entry, days_window, client)
+                if result:
+                    company_results.append({"label": f"{entry['label']} ({entry['title']})", "result": result})
+                else:
+                    st.error(f"Could not complete analysis for {entry['label']} ({entry['title']}) — skipping it in the comparison.")
+
+            if len(company_results) >= 2:
+                render_comparison(company_results)
+                for entry in company_results:
+                    with st.expander(f"Full report: {entry['label']}"):
+                        render_priority_callout(entry["result"]["opportunities"])
+                        for i, row in entry["result"]["opportunities"].head(8).iterrows():
+                            render_opportunity(row, entry["result"]["signals"], i + 1)
+            else:
+                st.warning("Fewer than 2 companies completed successfully — not enough to build a comparison.")
+    elif target_app or confirmed_competitors:
+        st.info("Confirm your company AND at least one competitor to run the comparison.")
 
 with tab2:
     st.markdown("### Analyze from pasted reviews")
