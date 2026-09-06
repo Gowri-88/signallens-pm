@@ -46,12 +46,14 @@ Below are {sample_count} EXAMPLE reviews from this cluster (not all {n} — just
 
 IMPORTANT: when you reference a count in your response, always use the TOTAL of {n} reviews, never the number of examples shown above.
 
+IMPORTANT — if this cluster actually contains multiple genuinely distinct problems that don't share a root cause (common with small clusters that had too little data to split further): do NOT create a compound "X, Y, and Z" theme name. Instead, name the theme after the single MOST FREQUENTLY mentioned issue only, briefly mention the other distinct issues within "observed", and explicitly say in "unknown" that this cluster mixes multiple distinct problems and would benefit from more data to separate them into their own opportunities. A focused, honest, narrower theme name is always better than a compound one.
+
 Based ONLY on what's actually in these reviews (do not invent facts not present), respond with ONLY a JSON object with these exact fields:
 {{
-  "theme_name": "a short, specific 5-10 word name for this problem",
+  "theme_name": "a short, specific 5-10 word name for ONE problem — never a compound list of multiple problems joined by commas/and",
   "observed": "1-2 sentences stating only what the reviews literally show, referencing the TOTAL review count ({n}), not the example count",
   "inferred": "1-2 sentences of reasonable interpretation, clearly distinguished from fact",
-  "unknown": "1-2 sentences on what remains genuinely unclear or unverified from this data alone",
+  "unknown": "1-2 sentences on what remains genuinely unclear or unverified from this data alone — including noting if this cluster mixes distinct problems due to limited data",
   "next_step": "one specific, concrete validation action a PM should take next — NEVER a build/fix instruction, always an investigation step",
   "success_metric": "one specific, measurable primary metric a PM would track to know if a future fix actually worked (e.g. 'refund approval rate for damaged-item claims', 'crash-free session rate on Android'). Must be concrete and specific to THIS problem, not generic.",
   "guardrail_metric": "one specific metric that should NOT get worse as a side effect of fixing this (e.g. 'average delivery time should not increase', 'support response time should not regress'). Must be a plausible tradeoff risk for THIS specific fix, not a generic guardrail."
@@ -713,14 +715,25 @@ def render_priority_callout(opportunities_df):
     if len(opportunities_df) == 0:
         return
     top = opportunities_df.iloc[0]
-    st.markdown("#### 🎯 If you can only act on one thing")
-    with st.container(border=True):
-        st.markdown(f"**{top['theme']}**")
-        st.caption(
-            f"Highest evidence strength ({top['evidence_strength']:.0f}/100) among "
-            f"{len(opportunities_df)} opportunities identified — based on signal volume, severity, "
-            f"and churn language. Start here; the rest are ranked below for additional context."
-        )
+    if len(opportunities_df) == 1:
+        st.markdown("#### ℹ️ Only one opportunity found")
+        with st.container(border=True):
+            st.markdown(f"**{top['theme']}**")
+            st.caption(
+                f"Evidence strength: {top['evidence_strength']:.0f}/100. This is the only distinct theme this "
+                f"run could form — likely due to limited signal volume. If the theme name below mentions "
+                f"multiple issues, that's a sign this cluster needs more data to split into separate opportunities, "
+                f"not a genuinely unified single problem."
+            )
+    else:
+        st.markdown("#### 🎯 If you can only act on one thing")
+        with st.container(border=True):
+            st.markdown(f"**{top['theme']}**")
+            st.caption(
+                f"Highest evidence strength ({top['evidence_strength']:.0f}/100) among "
+                f"{len(opportunities_df)} opportunities identified — based on signal volume, severity, "
+                f"and churn language. Start here; the rest are ranked below for additional context."
+            )
 
 
 def confidence_color(conf):
