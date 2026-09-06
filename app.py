@@ -89,9 +89,9 @@ NON_CONSUMER_APP_TERMS = [
 ]
 
 
-def find_app_candidates(company_name, n=6):
+def find_app_candidates(company_name, n=15):
     try:
-        results = gplay_search(company_name, lang="en", country="in", n_hits=10)
+        results = gplay_search(company_name, lang="en", country="in", n_hits=25)
         valid = [r for r in results if r.get("appId")]
         if not valid:
             return []
@@ -132,33 +132,38 @@ def find_app_candidates(company_name, n=6):
         return []
 
 
-MAX_REVIEWS_SAFETY_CAP = 400  # bounds classification time/cost even for a wide date window
+MAX_REVIEWS_SAFETY_CAP = 600  # bounds classification time/cost even for a wide date window — raised from 400
 
 def fetch_reviews(app_id, days_window=7):
-    import datetime
     cutoff = pd.Timestamp.now() - pd.Timedelta(days=days_window)
     all_reviews = []
     token = None
     last_error = None
-    for _ in range(20):  # safety limit on pagination loops
+    stop_reason = "window_reached"  # default if the loop completes normally
+    for _ in range(30):  # safety limit on pagination loops
         try:
             batch, token = gplay_reviews(app_id, lang="en", country="in", sort=Sort.NEWEST, count=100, continuation_token=token)
         except Exception as e:
             last_error = str(e)
+            stop_reason = "error"
             break
         if not batch:
+            stop_reason = "data_exhausted"
             break
         all_reviews.extend(batch)
         oldest_in_batch = min(pd.to_datetime(r["at"]) for r in batch)
         if oldest_in_batch < cutoff:
+            stop_reason = "window_reached"
             break
         if len(all_reviews) >= MAX_REVIEWS_SAFETY_CAP:
+            stop_reason = "cap_reached"
             break
         if token is None:
+            stop_reason = "data_exhausted"
             break
     df = pd.DataFrame(all_reviews)
     if len(df) == 0:
-        return df, last_error, None, None
+        return df, last_error, None, None, stop_reason
     df = df[["reviewId", "content", "score", "at"]]
     df["at"] = pd.to_datetime(df["at"])
     df = df[df["at"] >= cutoff]  # trim any overshoot past the window
@@ -167,10 +172,10 @@ def fetch_reviews(app_id, days_window=7):
     if len(df) > MAX_REVIEWS_SAFETY_CAP:
         df = df.head(MAX_REVIEWS_SAFETY_CAP)
     if len(df) == 0:
-        return df, None, None, None
+        return df, None, None, None, stop_reason
     date_min = df["at"].min()
     date_max = df["at"].max()
-    return df, None, date_min, date_max
+    return df, None, date_min, date_max, stop_reason
 
 
 def classify_reviews(client, df, progress_bar):
@@ -376,7 +381,7 @@ def run_full_analysis(company, app, days_window, client, extra_reviews_df=None):
     status.write(f"Using: **{app['title']}** ({app['appId']})")
 
     status.write("📥 Fetching reviews...")
-    reviews_df, fetch_error, date_min, date_max = fetch_reviews(app["appId"], days_window=days_window)
+    reviews_df, fetch_error, date_min, date_max, stop_reason = fetch_reviews(app["appId"], days_window=days_window)
     if len(reviews_df) < MIN_REVIEWS_REQUIRED:
         status.update(label="Not enough data", state="error")
         if fetch_error is not None:
@@ -391,6 +396,19 @@ def run_full_analysis(company, app, days_window, client, extra_reviews_df=None):
     date_range_str = f"{date_min.strftime('%Y-%m-%d')} to {date_max.strftime('%Y-%m-%d')}"
     date_span_days = (date_max - date_min).days
     status.write(f"📅 Date range covered: **{date_range_str}** ({date_span_days} day{'s' if date_span_days != 1 else ''})")
+    if date_span_days < days_window:
+        if stop_reason == "cap_reached":
+            status.write(
+                f"ℹ️ Stopped early because this app generates enough reviews to hit our "
+                f"{MAX_REVIEWS_SAFETY_CAP}-review safety cap before reaching {days_window} days — "
+                f"a genuinely high-volume app."
+            )
+        elif stop_reason == "data_exhausted":
+            status.write(
+                f"ℹ️ Stopped early because there simply weren't more reviews available to fetch — "
+                f"this app's retrievable review history through this data source is shorter than "
+                f"{days_window} days, not a cap issue."
+            )
 
     status.write("🏷️ Classifying reviews (this takes a few minutes)...")
     progress = st.progress(0, text="Starting classification...")
@@ -792,7 +810,7 @@ with tab1:
 
     if search_clicked and company.strip():
         with st.spinner("Searching Play Store..."):
-            candidates = find_app_candidates(company.strip(), n=8)
+            candidates = find_app_candidates(company.strip(), n=15)
         st.session_state.candidates = candidates
         st.session_state.company_query = company.strip()
 
