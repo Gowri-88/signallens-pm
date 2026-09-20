@@ -48,6 +48,8 @@ IMPORTANT: when you reference a count in your response, always use the TOTAL of 
 
 IMPORTANT — if this cluster actually contains multiple genuinely distinct problems that don't share a root cause (common with small clusters that had too little data to split further): do NOT create a compound "X, Y, and Z" theme name. Instead, name the theme after the single MOST FREQUENTLY mentioned issue only, briefly mention the other distinct issues within "observed", and explicitly say in "unknown" that this cluster mixes multiple distinct problems and would benefit from more data to separate them into their own opportunities. A focused, honest, narrower theme name is always better than a compound one.
 
+{mixing_guidance}
+
 Based ONLY on what's actually in these reviews (do not invent facts not present), respond with ONLY a JSON object with these exact fields:
 {{
   "theme_name": "a short, specific 5-10 word name for ONE problem — never a compound list of multiple problems joined by commas/and",
@@ -95,7 +97,11 @@ def find_app_candidates(company_name, n=15):
     try:
         results = gplay_search(company_name, lang="en", country="in", n_hits=25)
         valid = [r for r in results if r.get("appId")]
-        if not valid:
+        # Don't silently drop results with no appId — Play Store sometimes returns the
+        # exact match as a lightweight suggestion without one. Surface it so the person
+        # can still find it via manual package-ID entry instead of it vanishing invisibly.
+        no_id = [r for r in results if not r.get("appId") and r.get("title")]
+        if not valid and not no_id:
             return []
 
         query = company_name.lower()
@@ -129,7 +135,13 @@ def find_app_candidates(company_name, n=15):
             return penalty + relevance_bonus + length_tiebreak
 
         pool.sort(key=score)
-        return pool[:n]
+        top = pool[:n]
+        # append any name-only matches (no usable ID) as a visible, non-selectable hint —
+        # better than the app disappearing with no trace it was ever found
+        for r in no_id[:2]:
+            top.append({"title": f"{r['title']} (found by name, no ID available — use manual entry below)",
+                        "appId": None})
+        return top
     except Exception:
         return []
 
@@ -151,10 +163,12 @@ def app_search_widget(label, key_prefix):
         if len(candidates) == 0:
             st.error(f"No matches found for \"{st.session_state[f'{key_prefix}_query']}\".")
             return None
-        options = {f"{c['title']} — {c['appId']}": c for c in candidates}
+        options = {(c['title'] if c['appId'] is None else f"{c['title']} — {c['appId']}"): c for c in candidates}
         PLACEHOLDER = f"— Select {label}'s app —"
         choice = st.radio(f"Confirm {label}'s app", [PLACEHOLDER] + list(options.keys()), key=f"{key_prefix}_radio")
-        if choice != PLACEHOLDER:
+        if choice != PLACEHOLDER and options[choice]["appId"] is None:
+            st.warning("This match has no usable ID — use the manual package-ID box below instead.")
+        elif choice != PLACEHOLDER:
             return {"title": options[choice]["title"], "appId": options[choice]["appId"],
                      "query": st.session_state[f"{key_prefix}_query"]}
     return None
@@ -286,9 +300,23 @@ def generate_theme_analysis(client, company, subset, cluster_id, top_terms):
     cluster_df = subset[subset["sub_cluster"] == cluster_id]
     sample_list = cluster_df["content"].head(5).tolist()
     samples = "\n".join([f"- {c[:150]}" for c in sample_list])
+    n = len(cluster_df)
+    # A size-based gate: "mixes distinct problems due to limited data" is a claim about
+    # small samples. Letting the model apply it regardless of n made it fire on ~90% of
+    # opportunities, including a 61-review cluster — logically incoherent, since large n
+    # is the opposite of limited data. Only allow the caveat when it could honestly be true.
+    if n < 15:
+        mixing_guidance = ""
+    else:
+        mixing_guidance = (
+            f"NOTE: this cluster has {n} reviews — NOT a small sample. Do not say it \"mixes "
+            f"distinct problems due to limited data\" or similar — that claim is only valid for "
+            f"small clusters. With {n} reviews, if multiple angles of the same core problem appear, "
+            f"describe it as one problem with several manifestations, not as an artifact of too little data."
+        )
     prompt = THEME_PROMPT.format(
-        n=len(cluster_df), sample_count=len(sample_list), company=company,
-        top_terms=", ".join(top_terms), samples=samples
+        n=n, sample_count=len(sample_list), company=company,
+        top_terms=", ".join(top_terms), samples=samples, mixing_guidance=mixing_guidance
     )
     result_text = call_gemini(client, prompt)
     if result_text:
@@ -366,6 +394,15 @@ def apply_theme_merge(opportunities, all_subsets, groups):
         merged["signal_volume"] = total_vol
         merged["avg_rating"] = weighted_rating
         merged["pct_severe"] = weighted_severe
+        # The primary's "observed" text was written before merging and cites only its own
+        # original review count — leaving it as-is silently mismatches the new signal_volume
+        # (e.g. "61 signals" but text says "31 reviews"). Make the merge explicit instead.
+        n_members = len(members)
+        merged["observed"] = (
+            f"{primary['observed']} (This theme combines {n_members} closely related sub-clusters "
+            f"totaling {total_vol} signals; the summary above reflects the largest one, "
+            f"{primary['signal_volume']} of those signals.)"
+        )
         merged_opportunities.append(merged)
 
         combined_signals = pd.concat([all_subsets[i] for i in group], ignore_index=True)
@@ -376,8 +413,12 @@ def apply_theme_merge(opportunities, all_subsets, groups):
     return merged_opportunities, merged_subsets
 
 
-def evidence_strength(signal_volume, max_volume, avg_rating, pct_churn):
-    volume_score = min(40, (signal_volume / max_volume) * 40)
+def evidence_strength(signal_volume, avg_rating, pct_churn):
+    # Fixed absolute scale, NOT relative to the largest cluster in this one report —
+    # a bug we shipped originally normalized volume to each report's own max, which
+    # meant an 8-signal cluster in a small report could outscore a 60-signal cluster
+    # in a larger one. Scores are now comparable across different companies' reports.
+    volume_score = min(40, (signal_volume / 50) * 40)  # saturates at 50+ signals
     if avg_rating is not None:
         severity_score = ((5 - avg_rating) / 4) * 30
     else:
@@ -533,19 +574,31 @@ def run_full_analysis(company, app, days_window, client, extra_reviews_df=None):
 
     opp_df = pd.DataFrame(all_opportunities)
 
-    max_vol = opp_df["signal_volume"].max()
     opp_df["evidence_strength"] = opp_df.apply(
-        lambda r: evidence_strength(r["signal_volume"], max_vol, r["avg_rating"], 0), axis=1
+        lambda r: evidence_strength(r["signal_volume"], r["avg_rating"], 0), axis=1
     )
     opp_df["confidence"] = opp_df["evidence_strength"].apply(confidence_label)
     opp_df = opp_df.sort_values("evidence_strength", ascending=False).reset_index(drop=True)
 
+    # A low-severity, low-volume cluster (e.g. mostly-happy customers noting a minor gripe)
+    # scoring under 30 shouldn't sit numbered alongside genuine high-severity failures —
+    # move it out of the main ranked list rather than pretend it's comparable.
+    WEAK_FLOOR = 30
+    n_before = len(opp_df)
+    weak_df = opp_df[opp_df["evidence_strength"] < WEAK_FLOOR].reset_index(drop=True)
+    opp_df = opp_df[opp_df["evidence_strength"] >= WEAK_FLOOR].reset_index(drop=True)
+
     signals_df = pd.concat(all_subsets, ignore_index=True) if all_subsets else pd.DataFrame()
+
+    clustered_total = int(opp_df["signal_volume"].sum() + weak_df["signal_volume"].sum()) if n_before else 0
+    unclustered = len(reviews_df) - clustered_total
 
     status.update(label="Analysis complete!", state="complete")
     return {
-        "company": app["title"], "opportunities": opp_df, "signals": signals_df,
-        "total_reviews": len(reviews_df), "date_min": date_min, "date_max": date_max
+        "company": app["title"], "opportunities": opp_df, "weak_opportunities": weak_df,
+        "signals": signals_df, "total_reviews": len(reviews_df),
+        "clustered_total": clustered_total, "unclustered_total": unclustered,
+        "date_min": date_min, "date_max": date_max
     }
 
 
@@ -701,20 +754,26 @@ def run_pasted_analysis(company, source_label, reviews_df, client):
         status.write(f"🔗 Merged {n_merged} group(s) of duplicate themes into single opportunities.")
 
     opp_df = pd.DataFrame(all_opportunities)
-    max_vol = opp_df["signal_volume"].max()
     opp_df["evidence_strength"] = opp_df.apply(
-        lambda r: evidence_strength(r["signal_volume"], max_vol, r["avg_rating"], 0), axis=1
+        lambda r: evidence_strength(r["signal_volume"], r["avg_rating"], 0), axis=1
     )
     opp_df["confidence"] = opp_df["evidence_strength"].apply(confidence_label)
     opp_df = opp_df.sort_values("evidence_strength", ascending=False).reset_index(drop=True)
 
+    WEAK_FLOOR = 30
+    weak_df = opp_df[opp_df["evidence_strength"] < WEAK_FLOOR].reset_index(drop=True)
+    opp_df = opp_df[opp_df["evidence_strength"] >= WEAK_FLOOR].reset_index(drop=True)
+
     signals_df = pd.concat(all_subsets, ignore_index=True) if all_subsets else pd.DataFrame()
+    clustered_total = int(opp_df["signal_volume"].sum() + weak_df["signal_volume"].sum())
+    unclustered = len(reviews_df) - clustered_total
 
     status.update(label="Analysis complete!", state="complete")
     return {
-        "company": company, "opportunities": opp_df, "signals": signals_df,
-        "total_reviews": len(reviews_df), "source_label": source_label,
-        "n_with_rating": n_with_rating
+        "company": company, "opportunities": opp_df, "weak_opportunities": weak_df,
+        "signals": signals_df, "total_reviews": len(reviews_df), "source_label": source_label,
+        "n_with_rating": n_with_rating, "clustered_total": clustered_total,
+        "unclustered_total": unclustered
     }
 
 
@@ -770,6 +829,13 @@ def render_comparison(company_results):
         "identical wording). Volume differences are reported as observations, not verdicts — a category "
         "with more signal for one company means more complaints were found in this data, not a confirmed "
         "product failing."
+    )
+    st.caption(
+        "⚠️ Each company below was just analyzed fresh, right now. Category counts here are computed "
+        "independently from any report you downloaded separately for the same company earlier — they won't "
+        "match exactly, because live review data shifts over time and each run samples whatever is newest "
+        "at that moment. Re-running this comparison later may also produce somewhat different numbers "
+        "for the same reason, not because anything is broken."
     )
 
     # roll up each company's opportunities to category level
@@ -1063,6 +1129,14 @@ with tab1:
                         o2.metric("Opportunities found", len(result["opportunities"]))
                         o3.metric("Date range", f"{date_span_days} day{'s' if date_span_days != 1 else ''}")
                         o4.metric("Source", "Play Store")
+                        n_weak = len(result.get("weak_opportunities", []))
+                        st.caption(
+                            f"📊 {result['clustered_total']} of {result['total_reviews']} signals appear in an "
+                            f"opportunity below ({result['unclustered_total']} were positive, too small a group "
+                            f"to cluster reliably, or otherwise not a distinct problem)"
+                            + (f"; {n_weak} additional low-severity cluster(s) omitted from ranking below" if n_weak else "")
+                            + "."
+                        )
                         st.caption(
                             f"📅 Reviews span **{result['date_min'].strftime('%Y-%m-%d')}** to "
                             f"**{result['date_max'].strftime('%Y-%m-%d')}**. Always check this before trusting "
@@ -1128,6 +1202,14 @@ with tab1:
                 o2.metric("Opportunities found", len(result["opportunities"]))
                 o3.metric("Date range", f"{date_span_days} day{'s' if date_span_days != 1 else ''}")
                 o4.metric("Source", "Play Store")
+                n_weak = len(result.get("weak_opportunities", []))
+                st.caption(
+                    f"📊 {result['clustered_total']} of {result['total_reviews']} signals appear in an "
+                    f"opportunity below ({result['unclustered_total']} were positive, too small a group "
+                    f"to cluster reliably, or otherwise not a distinct problem)"
+                    + (f"; {n_weak} additional low-severity cluster(s) omitted from ranking below" if n_weak else "")
+                    + "."
+                )
                 st.caption(
                     f"📅 Reviews span **{result['date_min'].strftime('%Y-%m-%d')}** to "
                     f"**{result['date_max'].strftime('%Y-%m-%d')}**."
@@ -1224,39 +1306,44 @@ with tab1:
                     company_results.append({"label": f"{entry['label']} ({entry['title']})", "result": result})
                 else:
                     st.error(f"Could not complete analysis for {entry['label']} ({entry['title']}) — skipping it in the comparison.")
+            # Store in session_state, not a local variable — clicking a download button
+            # below triggers a full script rerun, and a local variable would vanish,
+            # making the whole comparison appear to silently reset.
+            st.session_state.cmp_results = company_results
 
-            if len(company_results) >= 2:
-                render_comparison(company_results)
-                for entry in company_results:
-                    with st.expander(f"Full report: {entry['label']}"):
-                        r = entry["result"]
-                        cmp_md = generate_report_markdown(
-                            r["company"], r["opportunities"], r["total_reviews"],
-                            "Google Play Store", r["date_min"], r["date_max"]
+        company_results = st.session_state.get("cmp_results", [])
+        if len(company_results) >= 2:
+            render_comparison(company_results)
+            for entry in company_results:
+                with st.expander(f"Full report: {entry['label']}"):
+                    r = entry["result"]
+                    cmp_md = generate_report_markdown(
+                        r["company"], r["opportunities"], r["total_reviews"],
+                        "Google Play Store", r["date_min"], r["date_max"]
+                    )
+                    cmp_pdf = generate_report_pdf(
+                        r["company"], r["opportunities"], r["total_reviews"],
+                        "Google Play Store", r["date_min"], r["date_max"]
+                    )
+                    safe_key = entry["label"].replace(" ", "_").replace("(", "").replace(")", "")
+                    dl1, dl2 = st.columns(2)
+                    with dl1:
+                        st.download_button(
+                            "📥 Download Report (PDF)", cmp_pdf,
+                            file_name=f"{r['company'].replace(' ', '_')}_SignalLens_Report.pdf",
+                            mime="application/pdf", key=f"download_cmp_pdf_{safe_key}"
                         )
-                        cmp_pdf = generate_report_pdf(
-                            r["company"], r["opportunities"], r["total_reviews"],
-                            "Google Play Store", r["date_min"], r["date_max"]
+                    with dl2:
+                        st.download_button(
+                            "📥 Download Report (Markdown)", cmp_md,
+                            file_name=f"{r['company'].replace(' ', '_')}_SignalLens_Report.md",
+                            mime="text/markdown", key=f"download_cmp_md_{safe_key}"
                         )
-                        safe_key = entry["label"].replace(" ", "_").replace("(", "").replace(")", "")
-                        dl1, dl2 = st.columns(2)
-                        with dl1:
-                            st.download_button(
-                                "📥 Download Report (PDF)", cmp_pdf,
-                                file_name=f"{r['company'].replace(' ', '_')}_SignalLens_Report.pdf",
-                                mime="application/pdf", key=f"download_cmp_pdf_{safe_key}"
-                            )
-                        with dl2:
-                            st.download_button(
-                                "📥 Download Report (Markdown)", cmp_md,
-                                file_name=f"{r['company'].replace(' ', '_')}_SignalLens_Report.md",
-                                mime="text/markdown", key=f"download_cmp_md_{safe_key}"
-                            )
-                        render_priority_callout(r["opportunities"])
-                        for i, row in r["opportunities"].head(8).iterrows():
-                            render_opportunity(row, r["signals"], i + 1)
-            else:
-                st.warning("Fewer than 2 companies completed successfully — not enough to build a comparison.")
+                    render_priority_callout(r["opportunities"])
+                    for i, row in r["opportunities"].head(8).iterrows():
+                        render_opportunity(row, r["signals"], i + 1)
+        else:
+            st.warning("Fewer than 2 companies completed successfully — not enough to build a comparison.")
     elif target_app or confirmed_competitors:
         st.info("Confirm your company AND at least one competitor to run the comparison.")
 
@@ -1306,6 +1393,14 @@ with tab2:
                 o1.metric("Signals analyzed", result["total_reviews"])
                 o2.metric("Opportunities found", len(result["opportunities"]))
                 o3.metric("Source", f"{result['source_label']} (pasted)")
+                n_weak = len(result.get("weak_opportunities", []))
+                st.caption(
+                    f"📊 {result['clustered_total']} of {result['total_reviews']} signals appear in an "
+                    f"opportunity below ({result['unclustered_total']} were positive, too small a group "
+                    f"to cluster reliably, or otherwise not a distinct problem)"
+                    + (f"; {n_weak} additional low-severity cluster(s) omitted from ranking below" if n_weak else "")
+                    + "."
+                )
 
                 with st.expander("⚠️ Data limitations — read before using this report", expanded=True):
                     st.markdown(f"""
