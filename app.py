@@ -10,6 +10,35 @@ from sklearn.cluster import KMeans
 
 st.set_page_config(page_title="SignalLens", page_icon="🔍", layout="wide")
 
+st.markdown("""
+<style>
+/* Visual separation between stacked sections — Streamlit's default renders everything
+   as identical plain boxes with no hierarchy, which reads as confusing clutter. */
+div[data-testid="stExpander"] {
+    border: 1px solid rgba(120,130,150,0.25);
+    border-radius: 10px;
+    margin-bottom: 0.6rem;
+}
+div[data-testid="stAlert"] {
+    border-radius: 8px;
+}
+h2, h3 {
+    margin-top: 1.6rem !important;
+    padding-top: 0.6rem;
+    border-top: 1px solid rgba(120,130,150,0.2);
+}
+hr {
+    margin: 2rem 0 1.5rem 0 !important;
+    opacity: 0.3;
+}
+div[data-testid="stButton"] button[kind="primary"] {
+    font-weight: 600;
+}
+/* tighten default caption spacing so pages of small text don't sprawl */
+div[data-testid="stCaptionContainer"] { margin-bottom: 0.3rem; }
+</style>
+""", unsafe_allow_html=True)
+
 CATEGORIES = [
     "delivery_problem", "refund_payment_issue", "support_experience",
     "app_bug_technical", "pricing_complaint", "delivery_partner_behavior",
@@ -1088,11 +1117,7 @@ with tab1:
     DAYS_MAP = {"Last 24 hours": 1, "Last 7 days": 7, "Last 30 days": 30}
     days_window = DAYS_MAP[time_window_label]
 
-    st.caption(
-        f"⏱️ Live analysis fetches reviews within your chosen window (capped at {MAX_REVIEWS_SAFETY_CAP} for "
-        f"speed/cost) and runs them through classification + clustering — typically takes 2-5 minutes. "
-        f"Companies need at least {MIN_REVIEWS_REQUIRED} public reviews in that window for a meaningful report."
-    )
+    st.caption(f"⏱️ Takes 2-5 minutes. Needs at least {MIN_REVIEWS_REQUIRED} public reviews in the chosen window.")
 
     if search_clicked and company.strip():
         with st.spinner("Searching Play Store..."):
@@ -1152,7 +1177,7 @@ with tab1:
                         with st.expander("⚠️ Data limitations — read before using this report", expanded=True):
                             st.markdown("""
     - **Single source** — Google Play Store only, no App Store/G2/Reddit yet.
-    - **Themes and analysis text are AI-generated live** for this specific run, grounded in the actual review quotes shown in each drill-down — but not independently human-validated the way our original Swiggy report was.
+    - **Themes and analysis are AI-generated from the reviews shown in each drill-down below** — verify anything important before acting on it.
                             """)
 
                         report_md = generate_report_markdown(
@@ -1182,7 +1207,7 @@ with tab1:
                         for i, row in top_n.iterrows():
                             render_opportunity(row, result["signals"], i + 1)
 
-    with st.expander("🔧 Can't find the right app? Enter its Play Store package ID directly"):
+    with st.expander("🔧 Can't find the right app above? Enter its Play Store package ID directly", expanded=True):
         st.caption(
             "Find this by searching the app on the Play Store website — the package ID is the part of the URL "
             "after `id=`, e.g. play.google.com/store/apps/details?id=**in.swiggy.android**"
@@ -1253,24 +1278,18 @@ with tab1:
                     render_opportunity(row, result["signals"], i + 1)
 
     if not st.session_state.candidates:
-        st.markdown("""
-        ### How this works
-        1. Enter a company name and click **Find App** — confirm the right one from the matches shown
-        2. Pick a time window that fits the company's review volume
-        3. Click **Analyze** — SignalLens fetches, classifies, clusters, and scores the evidence, with every
-           claim traceable back to a real review.
+        with st.expander("ℹ️ How this works"):
+            st.markdown("""
+1. Enter a company name and click **Find App** — confirm the right one from the matches shown
+2. Pick a time window that fits the company's review volume
+3. Click **Analyze** — get a report with every claim traceable back to a real review
 
-        **Note:** some companies (especially B2B SaaS) publish separate apps per product rather than one unified
-        company app — pick the specific product you want analyzed. Some companies (especially dev tools) may have
-        no meaningful consumer Play Store presence at all.
-        """)
+Some companies (especially B2B SaaS) publish separate apps per product — pick the specific one you want. Some (especially dev tools) may have no consumer Play Store app at all.
+            """)
 
     st.markdown("---")
     st.markdown("## 🆚 Compare with Competitors (optional)")
-    st.caption(
-        "Separate from the single-company analysis above. Runs the full pipeline once per company, so this "
-        "takes roughly 2-3x as long as a single report — expect 5-12 minutes for 2 companies, more for 3."
-    )
+    st.caption("Runs once per company — expect 5-12 minutes for 2 companies.")
 
     if "cmp_show_second" not in st.session_state:
         st.session_state.cmp_show_second = False
