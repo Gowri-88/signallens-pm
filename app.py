@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import re
 import json
 import time
@@ -203,7 +204,10 @@ def app_search_widget(label, key_prefix):
     return None
 
 
-MAX_REVIEWS_SAFETY_CAP = 600  # bounds classification time/cost even for a wide date window — raised from 400
+MAX_REVIEWS_SAFETY_CAP = 600  # max reviews SENT TO GEMINI per run (bounds classification time/cost)
+MAX_FETCH_PAGES = 60          # fetching is cheap (no Gemini): up to 60 x 100 = 6000 reviews are read per run
+# If the window holds more than MAX_REVIEWS_SAFETY_CAP reviews, we sample EVENLY ACROSS TIME
+# instead of keeping only the newest ones, so a wide window is represented, not just the latest day.
 
 def check_name_mention_rate(company_name, reviews_df, sample_size=100):
     """Sanity check for a real failure mode we found: some Play Store apps get rebranded
@@ -227,7 +231,7 @@ def fetch_reviews(app_id, days_window=7):
     token = None
     last_error = None
     stop_reason = "window_reached"  # default if the loop completes normally
-    for _ in range(30):  # safety limit on pagination loops
+    for _ in range(MAX_FETCH_PAGES):  # safety limit on pagination loops
         try:
             batch, token = gplay_reviews(app_id, lang="en", country="in", sort=Sort.NEWEST, count=100, continuation_token=token)
         except Exception as e:
@@ -242,7 +246,7 @@ def fetch_reviews(app_id, days_window=7):
         if oldest_in_batch < cutoff:
             stop_reason = "window_reached"
             break
-        if len(all_reviews) >= MAX_REVIEWS_SAFETY_CAP:
+        if len(all_reviews) >= MAX_FETCH_PAGES * 100:
             stop_reason = "cap_reached"
             break
         if token is None:
@@ -250,19 +254,23 @@ def fetch_reviews(app_id, days_window=7):
             break
     df = pd.DataFrame(all_reviews)
     if len(df) == 0:
-        return df, last_error, None, None, stop_reason
+        return df, last_error, None, None, stop_reason, 0
     df = df[["reviewId", "content", "score", "at"]]
     df["at"] = pd.to_datetime(df["at"])
     df = df[df["at"] >= cutoff]  # trim any overshoot past the window
     df = df[df["content"].str.len() >= 15].reset_index(drop=True)
     df = df.drop_duplicates(subset="content").reset_index(drop=True)
+    n_in_window = len(df)
     if len(df) > MAX_REVIEWS_SAFETY_CAP:
-        df = df.head(MAX_REVIEWS_SAFETY_CAP)
+        # sample evenly across time (oldest -> newest), not just the newest N
+        df = df.sort_values("at").reset_index(drop=True)
+        idx = np.linspace(0, len(df) - 1, MAX_REVIEWS_SAFETY_CAP).round().astype(int)
+        df = df.iloc[sorted(set(idx))].reset_index(drop=True)
     if len(df) == 0:
-        return df, None, None, None, stop_reason
+        return df, None, None, None, stop_reason, n_in_window
     date_min = df["at"].min()
     date_max = df["at"].max()
-    return df, None, date_min, date_max, stop_reason
+    return df, None, date_min, date_max, stop_reason, n_in_window
 
 
 def classify_reviews(client, df, progress_bar):
@@ -495,7 +503,7 @@ def run_full_analysis(company, app, days_window, client, extra_reviews_df=None):
     status.write(f"Using: **{app['title']}** ({app['appId']})")
 
     status.write("📥 Fetching reviews...")
-    reviews_df, fetch_error, date_min, date_max, stop_reason = fetch_reviews(app["appId"], days_window=days_window)
+    reviews_df, fetch_error, date_min, date_max, stop_reason, n_in_window = fetch_reviews(app["appId"], days_window=days_window)
     if len(reviews_df) < MIN_REVIEWS_REQUIRED:
         status.update(label="Not enough data", state="error")
         if fetch_error is not None:
@@ -507,6 +515,11 @@ def run_full_analysis(company, app, days_window, client, extra_reviews_df=None):
         )
         return None
     status.write(f"Collected {len(reviews_df)} reviews (after removing duplicates/near-empty).")
+    if n_in_window > len(reviews_df):
+        status.write(
+            f"🎯 The window held {n_in_window} usable reviews, so {len(reviews_df)} were sampled evenly across "
+            f"the dates. Counts in this report are counts within that sample, not the full window."
+        )
     date_range_str = f"{date_min.strftime('%Y-%m-%d')} to {date_max.strftime('%Y-%m-%d')}"
     date_span_days = (date_max - date_min).days
     status.write(f"📅 Date range covered: **{date_range_str}** ({date_span_days} day{'s' if date_span_days != 1 else ''})")
@@ -514,7 +527,7 @@ def run_full_analysis(company, app, days_window, client, extra_reviews_df=None):
         if stop_reason == "cap_reached":
             status.write(
                 f"ℹ️ Stopped early because this app generates enough reviews to hit our "
-                f"{MAX_REVIEWS_SAFETY_CAP}-review safety cap before reaching {days_window} days — "
+                f"{MAX_FETCH_PAGES * 100}-review fetch limit before reaching {days_window} days — "
                 f"a genuinely high-volume app."
             )
         elif stop_reason == "data_exhausted":
